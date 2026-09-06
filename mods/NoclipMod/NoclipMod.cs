@@ -65,22 +65,25 @@ public sealed class NoclipMod : IMod
     // nothing can drift, so it is left to the engine.
     private static readonly int[] BodyMirrors = { 0x40, 0x340, 0x4C0 };
 
-    // body+0x1C0 is the copy the renderer draws, and it keeps its own constant
-    // offset from the true position. It has to be written or nothing moves on
-    // screen - with the body immovable the engine never refreshes it - but
-    // writing it flat pops the player upward on release. So its offset is
-    // captured when the character is bound and preserved on every write.
-    // The render copy. Writing only its z made vertical movement show on screen
-    // while horizontal did not, so the whole vec3 is written - this is the form
-    // that demonstrably works. Note +0x1C0/+0x1C4 read as implausible floats,
-    // so they may not be coordinates; revisit before trusting this on another
-    // build of the game.
+    // body+0x1C0 was believed to be the copy the renderer draws, holding a
+    // constant offset from the true position, and was written every frame as
+    // position + that offset.
+    //
+    // It is not. Measured at a fresh bind, with the engine still driving the
+    // character, it reads (0, 0, 0) while the player stands at
+    // (582.6, 73.1, 1.8). A mirror of the position would read the position.
+    //
+    // Nothing writes it now, and movement works - which also disposes of the
+    // claim that it has to be written or nothing moves on screen. The offset
+    // term was the cause of movement teleporting: it grew with distance from
+    // the bind point. Writing raw coordinates instead was worse again.
+    //
+    // Kept only so bindCharacter can log what the field contains. Whatever it
+    // is, identify it from those numbers before writing anything here again.
     private const int RenderMirror = 0x1C0;
-    private Vector3 _renderOffset;
-
     /// <summary>
-    /// The character _renderOffset was captured from, so it is captured once per
-    /// character rather than once per noclip toggle.
+    /// The character the render field was last inspected for, so the diagnostic
+    /// is logged once per character rather than once per noclip toggle.
     /// </summary>
     /// <remarks>
     /// This is the whole bug that made noclip degrade the more it was used. The
@@ -223,8 +226,8 @@ public sealed class NoclipMod : IMod
             // Write every copy we know about. The rendered one is the client's,
             // so writing only the server's leaves the visible character free to
             // predict against us.
-            bool ok = PlaceCharacter(host, _clientCharacter, x, y, z, _renderOffset);
-            ok |= PlaceCharacter(host, _character, x, y, z, _renderOffset);
+            bool ok = PlaceCharacter(host, _clientCharacter, x, y, z);
+            ok |= PlaceCharacter(host, _character, x, y, z);
 
             lua.Push(ok);
             return 1;
@@ -339,12 +342,7 @@ public sealed class NoclipMod : IMod
                 nint body = host.Memory.ReadChain(found, PositionChainFirst, PositionChainSecond);
                 if (body != 0 && found != _renderOffsetFor)
                 {
-                    // All three components, deliberately. +0x1C0/+0x1C4 hold
-                    // pointer-like values, so their offsets come out enormous
-                    // and writing position+offset puts back very nearly the
-                    // original bytes - which is what leaves them intact. Zeroing
-                    // those offsets writes raw coordinates over the pointers and
-                    // freezes the camera.
+                    // Read purely to record what the field holds; see RenderMirror.
                     var mirror = new Vector3(
                         host.Memory.Read<float>(body + RenderMirror + 0),
                         host.Memory.Read<float>(body + RenderMirror + 4),
@@ -355,14 +353,16 @@ public sealed class NoclipMod : IMod
                         host.Memory.Read<float>(body + PositionOffset + 4),
                         host.Memory.Read<float>(body + PositionOffset + 8));
 
-                    _renderOffset = mirror - position;
+                    // Recorded once per character, for diagnosis only - nothing
+                    // is written back from it any more.
                     _renderOffsetFor = found;
 
                     // The raw values, not just their difference. An offset alone
                     // cannot distinguish "the mirror holds something else" from
                     // "the read failed and returned zero", and those need opposite
                     // fixes - a distinction that cost two wrong diagnoses.
-                    host.Log($"render offset ({_renderOffset.X:E2}, {_renderOffset.Y:E2}, {_renderOffset.Z:F3})" +
+                    Vector3 delta = mirror - position;
+                    host.Log($"render field delta ({delta.X:E2}, {delta.Y:E2}, {delta.Z:F3})" +
                              $" [body 0x{body:X}, mirror ({mirror.X:F3}, {mirror.Y:F3}, {mirror.Z:F3}),"
                              + $" position ({position.X:F3}, {position.Y:F3}, {position.Z:F3}),"
                              + $" readable {host.Memory.IsReadable(body + RenderMirror, 12)}]");
@@ -963,8 +963,7 @@ public sealed class NoclipMod : IMod
     /// Pins a character at a position and clears the state the engine would
     /// otherwise use to derive a fall from that movement.
     /// </summary>
-    private static bool PlaceCharacter(IModHost host, nint character, float x, float y, float z,
-                                       Vector3 renderOffset)
+    private static bool PlaceCharacter(IModHost host, nint character, float x, float y, float z)
     {
         if (character == 0)
             return false;
@@ -989,12 +988,23 @@ public sealed class NoclipMod : IMod
             }
         }
 
-        if (body != 0)
-        {
-            host.Memory.Write(body + RenderMirror + 0, x + renderOffset.X);
-            host.Memory.Write(body + RenderMirror + 4, y + renderOffset.Y);
-            host.Memory.Write(body + RenderMirror + 8, z + renderOffset.Z);
-        }
+        // body+0x1C0 is deliberately NOT written any more.
+        //
+        // It was written as position + a captured offset, on the theory that it
+        // mirrors the rendered position. The measurements say otherwise: at a
+        // fresh bind, with the engine still driving the character, it reads
+        // (0, 0, 0) while the player stands at (582.6, 73.1, 1.8). A position
+        // mirror would read the position.
+        //
+        // Whatever it is, position-derived values do not belong in it. Writing
+        // position + (mirror - position at bind) puts a value there that grows
+        // the further the player flies from the bind point, which is what showed
+        // up as movement teleporting; writing raw coordinates instead was worse.
+        // The seven writes above already cover the position, this one only ever
+        // added a term nothing could justify.
+        //
+        // The raw values are still logged at bind, so re-deriving what this field
+        // actually is starts from data rather than from this comment.
 
         host.Memory.Write<byte>(character + GroundedOffset, 1);
         host.Memory.Write(character + AirborneTimerOffset, 0f);
