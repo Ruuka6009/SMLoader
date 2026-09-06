@@ -90,4 +90,14 @@ void Write(const char* fmt, ...)
     }
 }
 
+void Shutdown()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_handle != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(g_handle);
+        g_handle = INVALID_HANDLE_VALUE;
+    }
+}
+
 } // namespace smloader::log

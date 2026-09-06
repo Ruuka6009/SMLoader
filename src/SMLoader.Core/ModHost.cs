@@ -11,9 +11,18 @@ internal sealed class ModHost : IModHost
     {
         RootDirectory = rootDirectory;
         _modName = modName;
-        Config = new ModConfig(Path.Combine(rootDirectory, "Config"), modName);
+
+        var config = new ModConfig(Path.Combine(rootDirectory, "Config"), modName);
+        Config = config;
+        OwnedConfig = config;
         Settings = new ModSettings(modName, Config);
     }
+
+    /// <summary>
+    /// The concrete config, so shutdown can flush a deferred write that has not
+    /// fired yet. IModConfig deliberately does not expose disposal.
+    /// </summary>
+    internal ModConfig OwnedConfig { get; }
 
     public IModConfig Config { get; }
 

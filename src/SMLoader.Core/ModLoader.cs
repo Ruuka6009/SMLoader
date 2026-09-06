@@ -20,6 +20,9 @@ internal sealed class ModLoader
     /// <summary>Names already taken, so a duplicate is caught rather than shadowing.</summary>
     private readonly HashSet<string> _names = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>One per loaded mod, kept so a pending config write can be flushed at exit.</summary>
+    private readonly List<ModHost> _hosts = new();
+
     public ModLoader(string root) => _root = root;
 
     public IReadOnlyList<IMod> Loaded => _loaded;
@@ -201,8 +204,12 @@ internal sealed class ModLoader
                 }
 
                 var host = new ModHost(_root, mod.Name);
+                _hosts.Add(host);
 
+                long started = Environment.TickCount64;
                 mod.OnLoad(host);
+                Metrics.ModLoadTime(Environment.TickCount64 - started);
+
                 _loaded.Add(mod);
                 Logging.Write($"loaded {mod.Name} {mod.Version} from {Path.GetFileName(assemblyPath)}");
             }
@@ -210,6 +217,20 @@ internal sealed class ModLoader
             {
                 Logging.Error($"failed to load '{type.FullName}' from mod '{name}'", ex);
             }
+        }
+    }
+
+    /// <summary>
+    /// Flushes anything a mod left pending. Called from the process-exit path,
+    /// so every failure is swallowed: a throw here turns a clean exit into a
+    /// crash report, and the settings are already the thing being lost.
+    /// </summary>
+    public void Shutdown()
+    {
+        foreach (ModHost host in _hosts)
+        {
+            try { host.OwnedConfig.Dispose(); }
+            catch { /* exiting anyway */ }
         }
     }
 

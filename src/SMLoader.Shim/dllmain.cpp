@@ -285,6 +285,26 @@ void SetLuaStateCallback(LuaStateCallback cb)
 
 namespace {
 
+HANDLE g_statusTimer = nullptr;
+
+void ReportStatus(int elapsedSeconds)
+{
+    SMLOG("status at %ds: %s; lua_States seen %d, late modules hooked %d",
+          elapsedSeconds,
+          smloader::iat::HookSummary(),
+          smloader::SeenStateCount(),
+          smloader::iat::LateHookedCount());
+}
+
+VOID CALLBACK StatusTick(PVOID, BOOLEAN)
+{
+    // Runs on a thread-pool thread. It only formats and appends a line, which
+    // is why the boot thread does not have to stay alive to do it.
+    static int elapsed = 180;
+    elapsed += 5 * 60;
+    ReportStatus(elapsed);
+}
+
 DWORD WINAPI BootThread(LPVOID)
 {
     // The Windows loader finishes resolving the exe's imports after our
@@ -308,19 +328,58 @@ DWORD WINAPI BootThread(LPVOID)
     {
         Sleep((seconds - elapsed) * 1000);
         elapsed = seconds;
-        SMLOG("status at %ds: hook %s, lua_States seen %d, late modules hooked %d",
-              elapsed,
-              smloader::iat::IsIntact() ? "intact" : "LOST",
-              smloader::SeenStateCount(),
-              smloader::iat::LateHookedCount());
+        ReportStatus(elapsed);
     }
+
+    // Then every five minutes for the life of the process, on a timer-queue
+    // thread rather than this one. Stopping at 180s meant a hook lost during a
+    // long session left no trace at all, and a hook lost after three minutes is
+    // exactly the interesting case - but parking a dedicated thread in Sleep
+    // for the rest of the session to say so is not the way to get it.
+    if (!CreateTimerQueueTimer(&g_statusTimer, nullptr, StatusTick, nullptr,
+                               5 * 60 * 1000, 5 * 60 * 1000, WT_EXECUTEDEFAULT))
+    {
+        SMLOG("CreateTimerQueueTimer failed (%lu); status checkpoints stop here",
+              GetLastError());
+    }
+
     return 0;
 }
 
 } // namespace
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 {
+    if (reason == DLL_PROCESS_DETACH)
+    {
+        // reserved is non-null when the process is terminating. The address
+        // space is going away, other threads are already dead, and touching
+        // another module's imports under the loader lock at that point buys
+        // nothing and can deadlock. Close the log and let the OS do the rest.
+        if (reserved != nullptr)
+        {
+            smloader::log::Shutdown();
+            return TRUE;
+        }
+
+        // A real FreeLibrary: every slot we patched points into memory that is
+        // about to be unmapped, so the process dies on the next call through
+        // one unless they are restored first.
+        SMLOG("shim unloading; restoring hooks");
+
+        // INVALID_HANDLE_VALUE waits for a callback already running to finish,
+        // which matters because that callback touches the log we close below.
+        if (g_statusTimer)
+        {
+            DeleteTimerQueueTimer(nullptr, g_statusTimer, INVALID_HANDLE_VALUE);
+            g_statusTimer = nullptr;
+        }
+
+        smloader::iat::UnhookAll();
+        smloader::log::Shutdown();
+        return TRUE;
+    }
+
     if (reason != DLL_PROCESS_ATTACH)
         return TRUE;
 

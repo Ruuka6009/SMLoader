@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text;
 using SMLoader.Api;
 
@@ -85,9 +86,16 @@ internal static class ScriptPatcher
 
         var key = (name, Hash(source));
         if (Cache.TryGetValue(key, out byte[]? cached))
+        {
+            Metrics.ScriptCompile(cacheHit: true);
             return cached;
+        }
 
+        Metrics.ScriptCompile(cacheHit: false);
+
+        long started = Stopwatch.GetTimestamp();
         byte[]? built = Build(name, source, registrations);
+        Metrics.ScriptTransformTime(Stopwatch.GetTimestamp() - started);
 
         if (Cache.Count >= MaxCacheEntries)
             Cache.Clear();

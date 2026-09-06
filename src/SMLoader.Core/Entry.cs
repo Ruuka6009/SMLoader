@@ -35,6 +35,13 @@ public static class Entry
     private static List<string> _splash = new();
     private static int _splashEchoed;
     private static int _handlersInstalled;
+    private static int _shutDown;
+
+    /// <summary>
+    /// Reports the counters periodically at Debug, so a session that misbehaves
+    /// leaves a trail without anyone having to ask for it in advance.
+    /// </summary>
+    private static Timer? _statsTimer;
 
     /// <summary>
     /// Native entry that receives the substrings mods want to match, so the
@@ -68,6 +75,7 @@ public static class Entry
                 _setPathFilter = (delegate* unmanaged[Cdecl]<nint, void>)context.SetPathFilter;
             SettingsPanel.Install();
             LuaState.ErrorSink = ex => Logging.Error("unhandled exception inside a Lua callback", ex);
+            LuaState.CallCounter = Metrics.LuaCall;
 
             _splash = Banner.Build("Mod Loader is starting", new[]
             {
@@ -88,6 +96,9 @@ public static class Entry
             // Publish even with no registrations: an empty needle list is how the
             // shim learns it can stop calling us entirely.
             AssetPatcher.PublishPathFilter();
+
+            _statsTimer = new Timer(_ => Logging.Debug(Metrics.Report()), null,
+                                    TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
 
             List<string> ready = Banner.Build("Ready", new[]
             {
@@ -154,6 +165,11 @@ public static class Entry
             Logging.Error($"FATAL unhandled exception (terminating: {e.IsTerminating})",
                           e.ExceptionObject as Exception);
 
+        // Best effort: a force-quit never reaches this. It is worth having
+        // anyway for the ordinary exit, and it is where anything that must be
+        // flushed belongs as the loader grows a real shutdown.
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => Shutdown();
+
         TaskScheduler.UnobservedTaskException += (_, e) =>
         {
             Logging.Error("unobserved task exception", e.Exception);
@@ -177,6 +193,28 @@ public static class Entry
             publish((nint)p);
     }
 
+    /// <summary>
+    /// Ordinary-exit teardown. Deliberately small and exception-proof: it runs
+    /// while the runtime is already shutting down, and anything that throws
+    /// here replaces a clean exit with a crash report.
+    /// </summary>
+    private static void Shutdown()
+    {
+        if (Interlocked.Exchange(ref _shutDown, 1) != 0)
+            return;
+
+        try
+        {
+            _statsTimer?.Dispose();
+            _modLoader?.Shutdown();
+            Logging.Write($"shutting down - {Metrics.Report()}");
+        }
+        catch
+        {
+            // Nothing useful left to do with it at this point.
+        }
+    }
+
     private static string DescribeMods()
     {
         IReadOnlyList<Api.IMod> mods = _modLoader?.Loaded ?? Array.Empty<Api.IMod>();
@@ -193,6 +231,7 @@ public static class Entry
         // into native code.
         try
         {
+            Metrics.StateCreated();
             Logging.Debug($"lua_State 0x{L:x} available");
             var lua = new LuaState(L);
 
@@ -215,6 +254,7 @@ public static class Entry
     {
         try
         {
+            Metrics.StateClosed();
             LuaApi.Release(L);
         }
         catch (Exception ex)

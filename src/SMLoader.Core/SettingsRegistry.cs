@@ -108,6 +108,14 @@ internal static class SettingsRegistry
 
         // Lets loader-injected Lua report into the loader log, which the panel
         // needs since its errors are swallowed by a pcall.
+        // Lets the counters be read from in-game rather than only from the log,
+        // which is the difference between checking a claim and filing a bug.
+        LuaApi.Add("SMLoader", "stats", lua =>
+        {
+            lua.Push(Metrics.Report());
+            return 1;
+        });
+
         LuaApi.Add("SMLoader", "logMessage", lua =>
         {
             Logging.Write("[panel] " + (lua.ToStringValue(1) ?? "(nil)"));

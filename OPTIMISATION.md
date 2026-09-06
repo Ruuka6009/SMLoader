@@ -849,7 +849,7 @@ materialises the entire `Modules` collection per call. Cache the main module
 base/size once (the constructor already does) and use `GetModuleHandleW` +
 `GetModuleInformation` for other modules instead of the `Process` API.
 
-### 2.20 [P] `BootThread` burns a thread for three minutes
+### 2.20 [P] `BootThread` burns a thread for three minutes — PARTLY RESOLVED with [§11.5](#115-q-the-status-at-ns-checkpoints-are-a-good-idea-half-finished)
 
 `src/SMLoader.Shim/dllmain.cpp:186-215` — 200 × `Sleep(5)` then sleeps out to
 the 180-second checkpoint. Harmless, but the reapply loop can exit as soon as
@@ -1166,12 +1166,33 @@ works.
 managed path. Correct as a policy, but a *persistent* failure is invisible. Count
 failures, log the first, then one line per thousand.
 
-### 5.9 [E] No graceful shutdown
+### 5.9 [E] ~~No graceful shutdown~~ — RESOLVED
 
 Nothing runs at process exit: pending config writes are not flushed, log buffers
 are not drained, IAT hooks are not removed, `AllocHGlobal` buffers are not
 audited. Add a `DLL_PROCESS_DETACH` path in the shim (unhook, flush) and a
 `ProcessExit` handler on the managed side (flush configs and the log).
+
+**Both applied**, and the shim's detach path distinguishes the two cases, which
+matters more than it looks:
+
+- `lpReserved != nullptr` means the **process is terminating**. Other threads are
+  already dead and the address space is going away, so walking another module's
+  imports under the loader lock buys nothing and can deadlock. It closes the log
+  handle and returns.
+- `lpReserved == nullptr` means a real `FreeLibrary`, which is the case
+  [§7.4](#74-e-the-shim-never-unhooks) is about: every patched slot is about to
+  point into unmapped memory. It stops the status timer, restores every hook, and
+  closes the log.
+
+On the managed side `Entry.Shutdown` disposes each mod's `ModConfig` — which is
+what turns the deferred write from §2.5 into something with a defined worst case
+— and writes the counters from §11.4 as a last line. It is `Interlocked`-guarded
+and swallows everything: a throw in a `ProcessExit` handler replaces a clean exit
+with a crash report, and the settings are already the thing being lost.
+
+Still best effort. A force-quit reaches none of this, which is why §5.5 made the
+write atomic and §2.5 kept the deferral window at one second.
 
 ### 5.10 [E] Missing `lua_checkstack` before multi-value pushes
 
@@ -1383,13 +1404,20 @@ silently do not match, so `ntdll` could be hooked after all, which is exactly
 what the comment above says must never happen. Check the return and skip the
 module on failure.
 
-### 7.4 [E] The shim never unhooks
+### 7.4 [E] ~~The shim never unhooks~~ — RESOLVED with [§5.9](#59-e-no-graceful-shutdown)
 
 There is no `DLL_PROCESS_DETACH` handling (`dllmain.cpp:221` returns early for
 every reason but attach). If the shim is ever unloaded — by a debugger, by a
 tool, by a future `FreeLibrary` — every patched IAT slot points into freed memory
 and the process dies on the next Lua call. Add a detach path that restores all
 slots.
+
+`iat::UnhookAll` does this. Loader notifications are unregistered **first**,
+because once the slots are restored a module arriving would otherwise be hooked
+into a detour that is about to stop existing. `CreateFileW` was hooked across
+many modules without recording which, so it enumerates again and restores any
+slot still pointing at our detour; the five Lua slots are each one known
+address.
 
 ### 7.5 [Q] `log::Write` truncates silently
 
@@ -1958,7 +1986,7 @@ The shim truncates on launch (`log.cpp:25`), so a crash's log is destroyed by th
 next launch attempt — exactly when the player is retrying and about to report the
 problem. Keep `smloader.log` plus `smloader.log.1`, rotating on launch.
 
-### 11.4 [Q] No timing or counters
+### 11.4 [Q] ~~No timing or counters~~ — RESOLVED
 
 Add cheap instrumentation the loader can report on demand:
 
@@ -1972,11 +2000,45 @@ seconds at `Debug`. Without this, every claim in [§2](#2-hot-path-performance) 
 an argument rather than a measurement — and the first thing to do with this
 document is turn its performance items into numbers.
 
-### 11.5 [Q] The `status at Ns` checkpoints are a good idea, half-finished
+**Applied**, as a `Metrics` class of `Interlocked` counters: Lua→C# calls,
+`lua_State`s created and closed, script compiles with cache-hit rate and total
+transform time, file opens that reached managed code with redirect and cache-hit
+counts, and total mod load time. `smloader.stats()` returns the same line the
+60-second `Debug` report writes, and `Entry.Shutdown` writes it once more on the
+way out.
+
+The sentence above turned out to be the important one. §2.2 claimed "over 4,000
+`VirtualQuery` calls per second" from reading the code, and the fix built on that
+reasoning broke the game twice before being reverted. Every remaining number in
+§2 is still a derivation, not a measurement — these counters are the beginning of
+fixing that, and the per-frame allocation figure in §2.1 in particular deserves
+to be checked rather than believed.
+
+What is deliberately **not** counted: anything requiring a p50/p99 histogram, and
+anything on the native side of the `CreateFileW` prefilter. The native counters
+are reported through the status checkpoints instead (§11.5), which avoids adding
+a managed call to the hottest path in the shim purely to measure it.
+
+### 11.5 [Q] ~~The `status at Ns` checkpoints are a good idea, half-finished~~ — RESOLVED
 
 `dllmain.cpp:203-213` reports hook integrity at 15/60/180 s and then stops
 forever. Make it periodic (every five minutes at `Debug`), and report all five
 hooks rather than only `luaL_newstate`.
+
+Both applied. `iat::HookSummary` reports all five as intact/LOST/absent — the old
+line only covered `luaL_newstate`, which hid the case where it survives and one
+of the others does not.
+
+The five-minute repeat runs on a **timer-queue timer**, not by keeping the boot
+thread parked in `Sleep` for the session. That would have made
+[§2.20](#220-p-bootthread-burns-a-thread-for-three-minutes) worse in the act of
+fixing this one, and the second half of §2.20 — "the checkpoints can hang off a
+waitable timer rather than a dedicated thread" — is exactly what this needed. The
+boot thread now returns after 180 seconds as it always did.
+
+§2.20's other half, exiting the re-apply loop early once the slot has been
+stable, is deliberately left alone. It saves under a second on a background
+thread, and getting it wrong means the loader silently fails to hook anything.
 
 ---
 
@@ -2056,7 +2118,9 @@ deliberately left until there is a shutdown path to flush it.
     ~~handshake~~ and ~~deterministic order~~ done, and §8.3 with them.
     Manifests, dependencies and `PatchScript(priority)` are still open
 27. §8.4 Collectible load contexts and disposable registrations → hot reload
-28. §11.4 Instrumentation, so the next version of this document has numbers in it
+28. ~~§11.4 Instrumentation, so the next version of this document has numbers in
+    it~~ — done, and §11.5 / §5.9 / §7.4 with it. The numbers themselves are the
+    next step: the counters exist, a session's worth of them does not
 
 ---
 

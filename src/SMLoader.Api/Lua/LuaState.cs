@@ -175,6 +175,8 @@ public readonly struct LuaState
         // takes the process down. Swallow and report instead.
         try
         {
+            CallCounter?.Invoke();
+
             int id = (int)lua_tointeger(L, UpvalueIndex(1));
             if (!ById.TryGetValue(id, out LuaFunction? function))
                 return 0;
@@ -190,4 +192,11 @@ public readonly struct LuaState
 
     /// <summary>Receives exceptions thrown by mod code inside a Lua callback.</summary>
     public static Action<Exception>? ErrorSink { get; set; }
+
+    /// <summary>
+    /// Called once per Lua-to-managed call, for the loader's own counters.
+    /// Null unless something set it, so the cost is a null check on a path
+    /// that is already crossing a P/Invoke boundary.
+    /// </summary>
+    public static Action? CallCounter { get; set; }
 }

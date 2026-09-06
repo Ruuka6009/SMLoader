@@ -6,6 +6,7 @@
 #include <winternl.h>
 #include <psapi.h>
 #include <cstring>
+#include <cstdio>
 #include <vector>
 
 namespace {
@@ -267,6 +268,7 @@ constexpr ULONG kDllLoaded = 1;
 using LdrNotificationCallback = VOID(CALLBACK*)(ULONG, const LdrNotificationData*, PVOID);
 using LdrRegisterDllNotification_t =
     LONG(NTAPI*)(ULONG, LdrNotificationCallback, PVOID, PVOID*);
+using LdrUnregisterDllNotification_t = LONG(NTAPI*)(PVOID);
 
 // Runs with the loader lock held. Nothing here may log, allocate, or call
 // back into the loader - the same trap HookFileApis documents for DllMain.
@@ -505,6 +507,73 @@ int LateHookedCount()
     return static_cast<int>(g_lateHooked);
 }
 
+void UnhookAll()
+{
+    // Loader notifications first: once the slots are restored, a module
+    // arriving would otherwise be hooked into a detour that is about to stop
+    // existing.
+    if (g_notificationCookie)
+    {
+        if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll"))
+        {
+            auto unregister = reinterpret_cast<LdrUnregisterDllNotification_t>(
+                reinterpret_cast<void*>(GetProcAddress(ntdll, "LdrUnregisterDllNotification")));
+            if (unregister)
+                unregister(g_notificationCookie);
+        }
+        g_notificationCookie = nullptr;
+    }
+
+    // CreateFileW is hooked in many modules and we did not record which, so
+    // walk them again and restore any slot still pointing at our detour.
+    if (g_originalCreateFileW)
+    {
+        const HANDLE self = GetCurrentProcess();
+        DWORD needed = 0;
+        if (EnumProcessModules(self, nullptr, 0, &needed) && needed != 0)
+        {
+            std::vector<HMODULE> modules(needed / sizeof(HMODULE) + 16);
+            if (EnumProcessModules(self, modules.data(),
+                                   static_cast<DWORD>(modules.size() * sizeof(HMODULE)),
+                                   &needed))
+            {
+                size_t count = needed / sizeof(HMODULE);
+                if (count > modules.size())
+                    count = modules.size();
+
+                for (size_t i = 0; i < count; ++i)
+                {
+                    void** slot = FindIatSlot(modules[i], "KERNEL32.dll", "CreateFileW");
+                    if (!slot)
+                        slot = FindIatSlot(modules[i], "api-ms-win-core-file-l1-1-0.dll",
+                                           "CreateFileW");
+
+                    if (slot && *slot == reinterpret_cast<void*>(&Detour_CreateFileW))
+                        WriteSlot(slot, reinterpret_cast<void*>(g_originalCreateFileW));
+                }
+            }
+        }
+    }
+
+    // The Lua slots are each a single known location.
+    if (g_slot && *g_slot == reinterpret_cast<void*>(&Detour_luaL_newstate))
+        WriteSlot(g_slot, reinterpret_cast<void*>(g_original));
+    if (g_pcallSlot && *g_pcallSlot == reinterpret_cast<void*>(&Detour_lua_pcall))
+        WriteSlot(g_pcallSlot, reinterpret_cast<void*>(g_originalPcall));
+    if (g_setfenvSlot && *g_setfenvSlot == reinterpret_cast<void*>(&Detour_lua_setfenv))
+        WriteSlot(g_setfenvSlot, reinterpret_cast<void*>(g_originalSetfenv));
+    if (g_loadSlot && *g_loadSlot == reinterpret_cast<void*>(&Detour_luaL_loadbufferx))
+        WriteSlot(g_loadSlot, reinterpret_cast<void*>(g_originalLoad));
+    if (g_closeSlot && *g_closeSlot == reinterpret_cast<void*>(&Detour_lua_close))
+        WriteSlot(g_closeSlot, reinterpret_cast<void*>(g_originalClose));
+
+    g_slot = nullptr;
+    g_pcallSlot = nullptr;
+    g_setfenvSlot = nullptr;
+    g_loadSlot = nullptr;
+    g_closeSlot = nullptr;
+}
+
 void RetirePcallHook()
 {
     if (!g_pcallSlot)
@@ -519,6 +588,26 @@ void RetirePcallHook()
 bool IsIntact()
 {
     return g_slot != nullptr && *g_slot == reinterpret_cast<void*>(&Detour_luaL_newstate);
+}
+
+const char* HookSummary()
+{
+    static char summary[160];
+
+    auto state = [](void** slot, void* detour) -> const char* {
+        if (!slot)
+            return "absent";
+        return (*slot == detour) ? "intact" : "LOST";
+    };
+
+    _snprintf_s(summary, sizeof(summary), _TRUNCATE,
+                "newstate %s, pcall %s, setfenv %s, load %s, close %s",
+                state(g_slot, reinterpret_cast<void*>(&Detour_luaL_newstate)),
+                state(g_pcallSlot, reinterpret_cast<void*>(&Detour_lua_pcall)),
+                state(g_setfenvSlot, reinterpret_cast<void*>(&Detour_lua_setfenv)),
+                state(g_loadSlot, reinterpret_cast<void*>(&Detour_luaL_loadbufferx)),
+                state(g_closeSlot, reinterpret_cast<void*>(&Detour_lua_close)));
+    return summary;
 }
 
 } // namespace smloader::iat

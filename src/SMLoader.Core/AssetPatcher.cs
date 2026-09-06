@@ -83,8 +83,12 @@ internal static class AssetPatcher
         if (Resolved.Count >= MaxCachedPaths)
             Trim();
 
-        return Resolved.GetOrAdd(path, static p =>
+        bool cacheHit = Resolved.ContainsKey(path);
+        string? resolved = Resolved.GetOrAdd(path, static p =>
             new Lazy<string?>(() => Build(p), LazyThreadSafetyMode.ExecutionAndPublication)).Value;
+
+        Metrics.FileOpen(redirected: resolved is not null, cacheHit: cacheHit);
+        return resolved;
     }
 
     /// <summary>
