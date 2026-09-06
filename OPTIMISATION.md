@@ -376,7 +376,7 @@ to null or used `LuaState?`, so no call site changed — but it *is* a source-
 breaking change for any mod that did, which nothing outside this repository has
 had the chance to do yet.
 
-### 2.2 [P] ~~Every memory read costs a `VirtualQuery`~~ — RESOLVED, one of the two fixes
+### 2.2 [P] Every memory read costs a `VirtualQuery` — ATTEMPTED AND REVERTED
 
 `src/SMLoader.Core/ProcessMemory.cs:79-113`
 
@@ -409,55 +409,44 @@ public interface IMemoryRegion
 }
 ```
 
-**The first fix is applied. The second is deliberately not, and the reason
-matters more than the code.**
+**Attempted, reverted, and the reason is the most useful thing in this section.**
 
-`ProcessMemory` keeps eight recently-seen region descriptors per thread, newest
-first, each good for 250ms; `HasProtection` walks those instead of calling
-`VirtualQuery`. A mod hammering one object hits the first entry every time, so
-the syscall becomes a couple of compares. `[ThreadStatic]` rather than locked —
-a shared cache would put a contended cache line on the render path to save a
-syscall on it. `TryUnprotect` and `Protect` clear it, since a deliberate
-protection change is exactly the case a stale descriptor would get wrong.
+A per-thread cache of eight recently-seen region descriptors was added, each
+good for 250ms, so `HasProtection` could answer without a syscall. It broke
+NoclipMod twice, in two different ways, and was reverted whole.
 
-**It shipped with a bug, and the bug is worth recording.** The first version
-cached every descriptor `VirtualQuery` returned. But a query against *free or
-reserved* address space answers with one descriptor spanning everything up to the
-next allocation — frequently gigabytes. Caching one of those makes every address
-inside it read as unreadable until the entry expires, including memory committed
-there a moment later. `bindCharacter`'s pointer-graph walk probes exactly such
-addresses, so it poisoned the cache for its own object; `Read<T>` then returned
-zeroes and `Write<T>` silently failed, which showed up in-game as noclip movement
-being dead on the first world load and fine after a reload.
+**First failure.** `VirtualQuery` against *free or reserved* address space
+answers with one descriptor spanning everything up to the next allocation —
+frequently gigabytes. Caching one makes every address inside it read as
+unreadable until the entry expires, including memory committed there a moment
+later. `bindCharacter`'s pointer-graph walk probes exactly such addresses, so it
+poisoned the cache for its own object.
 
-The log named it precisely — a render offset of exactly minus the world position
-is what a zero read looks like:
+**Second failure.** Restricting the cache to committed, non-guard regions fixed
+the first world load and broke the *second* one instead. At that point the
+lesson was no longer about which regions to cache:
 
-```
-first load:   render offset (-4.23E+002, -1.02E+002, -1.407)
-after reload: render offset (0.00E+000, 0.00E+000, 0.000)
-```
+| run | load 1 | load 2 |
+|---|---|---|
+| cache as first written | `(-423, -102, -1.4)` broken | `(0, 0, 0)` working |
+| cache restricted to committed | `(0, 0, 0)` working | `(-422, -89.8, 545)` broken |
 
-Only **committed, non-guard** regions are cached now. Those are the stable ones
-and the only ones on a path that matters; everything else asks the kernel every
-time, which costs nothing in practice. Guard pages are excluded because the flag
-clears on first touch.
+Those are `bindCharacter`'s reported render offsets. The cache was not producing
+a wrong answer in one identifiable place — it was making *which* reads succeed
+depend on what had been probed in the preceding 250ms, so the same code gave a
+different answer on the first world load than on the second.
 
-**What this does and does not cost.** It is easy to read the cache as trading
-safety for speed. It is not, quite. Querying immediately before dereferencing
-never made the dereference safe either — nothing holds the mapping still between
-the query and the write — so the guarantee was always "very probably still
-mapped", and the 250ms lifetime is only how much of that probability is being
-spent. The check catches a *wrong offset from a mod*, which is what it is for,
-and it goes on doing that.
+**Why reverting was right rather than a third attempt.** The syscall it saves is
+invisible to a player; the reads it perturbs are the foundation every memory mod
+stands on. `Read<T>` returning `0` for readable memory is indistinguishable from
+a legitimately zero field, so the failure is silent and lands in the mod rather
+than here — the two hours this cost were spent in the mod's coordinate maths,
+not in this file.
 
-**Why `IMemoryRegion` was left out.** With the cache in place its remaining win
-is a handful of compares, and what it adds is a public, permanent way for a mod
-to read through a pointer that nothing is checking any more. The cheap half of
-the benefit came with the honest half of the risk; the expensive half of the
-risk bought very little. Worth revisiting only if a profile shows those compares
-mattering — and if it comes back, it should re-validate on the same 250ms stamp
-rather than being a raw pointer with a nice name.
+**If it is ever reattempted**, it needs: an opt-in switch so it can be bisected
+in one session without a rebuild, a counter for cache hits that answered
+"unreadable", and validation in-game across at least two world loads before
+being believed. It is not worth doing without those.
 
 ### 2.3 [P] ~~`IsGameFocused()` makes two USER32 calls per key check~~ — RESOLVED
 
@@ -1886,9 +1875,9 @@ Next up is the performance block, starting at §2.1.
 ### Then — performance, in descending order of expected win
 
 12. ~~§2.1 `LuaState` as a struct (removes ~10 allocations per frame)~~ — done
-13. ~~§2.2 Region-cached or handle-based memory access (removes ~4,000 syscalls/s)~~ —
-    done as the region cache; the `IMemoryRegion` handle was deliberately not
-    added, see the item
+13. §2.2 Region-cached or handle-based memory access (removes ~4,000 syscalls/s) —
+    **attempted and reverted**; it broke NoclipMod in two different ways. Read
+    the item before trying again
 14. ~~§2.10 Native prefilter before entering managed code on `CreateFileW`~~ —
     done, driven by the registered patterns rather than a hard-coded rule
 15. ~~§2.6 Cache patched script output by content hash~~ — done, and §2.7 / §2.8
@@ -1900,8 +1889,8 @@ Next up is the performance block, starting at §2.1.
 19. ~~§2.9 Atomics instead of mutexes for the write-once callbacks~~ — done, and
     §3.7 fell out of §2.8
 
-The performance block is done. Next is hardening and tooling, starting at item
-20.
+The performance block is done apart from §2.2, which was tried and reverted.
+Next is hardening and tooling, starting at item 20.
 
 ### Then — hardening and tooling
 
