@@ -12,6 +12,7 @@ internal static class Injector
 {
     private const uint CREATE_SUSPENDED = 0x00000004;
     private const uint INFINITE = 0xFFFFFFFF;
+    private const uint WAIT_FAILED = 0xFFFFFFFF;
 
     private const uint MEM_COMMIT  = 0x1000;
     private const uint MEM_RESERVE = 0x2000;
@@ -80,7 +81,12 @@ internal static class Injector
 
             try
             {
-                WaitForSingleObject(thread, INFINITE);
+                // WAIT_FAILED here would leave GetExitCodeThread reporting a
+                // value for a thread we never actually waited on, which reads as
+                // a successful injection.
+                if (WaitForSingleObject(thread, INFINITE) == WAIT_FAILED)
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "WaitForSingleObject failed");
+
                 if (!GetExitCodeThread(thread, out uint moduleHandle))
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "GetExitCodeThread failed");
 

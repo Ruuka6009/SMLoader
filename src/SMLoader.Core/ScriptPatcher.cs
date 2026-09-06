@@ -167,7 +167,9 @@ internal static class ScriptPatcher
         if (UnmatchedSeen.Count >= MaxUnmatchedLogged)
             return;
 
+        // Trace: dozens of these per world load, and they exist for a mod
+        // author hunting a chunk name, not for a player sending in a log.
         if (UnmatchedSeen.TryAdd(name, 0))
-            Logging.Write($"script: {name}");
+            Logging.Trace($"script: {name}");
     }
 }

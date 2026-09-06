@@ -1,5 +1,7 @@
 using System.Reflection;
 using System.Runtime.Loader;
+using System.Security.Cryptography;
+using System.Text.Json;
 using SMLoader.Api;
 
 namespace SMLoader.Core;
@@ -12,12 +14,23 @@ internal sealed class ModLoader
     private readonly string _root;
     private readonly List<IMod> _loaded = new();
 
+    /// <summary>File name -> expected SHA-256, or null when no allowlist is in force.</summary>
+    private Dictionary<string, string>? _allowed;
+
     public ModLoader(string root) => _root = root;
 
     public IReadOnlyList<IMod> Loaded => _loaded;
 
     public void LoadAll()
     {
+        // Safe mode. The point of it is to answer "is this SMLoader or is this a
+        // mod?" in one launch, without the player having to move folders around.
+        if (Environment.GetEnvironmentVariable("SMLOADER_NO_MODS") == "1")
+        {
+            Logging.Write("safe mode (--no-mods): no mods will be loaded");
+            return;
+        }
+
         string modsDirectory = Path.Combine(_root, "Mods");
         if (!Directory.Exists(modsDirectory))
         {
@@ -25,10 +38,87 @@ internal sealed class ModLoader
             return;
         }
 
+        LoadAllowList(modsDirectory);
+
         foreach (string modDirectory in Directory.EnumerateDirectories(modsDirectory))
             LoadFrom(modDirectory);
 
         Logging.Write($"{_loaded.Count} mod(s) loaded");
+
+        if (_loaded.Count > 0)
+        {
+            // Said at every launch, not just the first: a mod added last week is
+            // still native code running with this user's privileges today.
+            Logging.Write("mods run as native code inside ScrapMechanic.exe with your " +
+                          "account's full privileges; SMLoader does not sandbox them");
+        }
+    }
+
+    /// <summary>
+    /// Optional SHA-256 allowlist at <c>Mods/allowed.json</c>, shaped
+    /// <c>{ "NoclipMod.dll": "&lt;hex&gt;" }</c>. Absent means every mod loads,
+    /// which is the default and matches what the loader has always done.
+    /// </summary>
+    private void LoadAllowList(string modsDirectory)
+    {
+        if (Environment.GetEnvironmentVariable("SMLOADER_ANY_MOD") == "1")
+        {
+            Logging.Write("--any-mod: the allowlist is ignored for this launch");
+            return;
+        }
+
+        string path = Path.Combine(modsDirectory, "allowed.json");
+        if (!File.Exists(path))
+            return;
+
+        try
+        {
+            _allowed = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(path));
+            Logging.Write($"allowlist active: {_allowed?.Count ?? 0} entr(ies) from {path}");
+        }
+        catch (Exception ex)
+        {
+            // Refuse everything rather than silently degrading to "load anything":
+            // a corrupt allowlist must not be a way past the allowlist.
+            _allowed = new Dictionary<string, string>();
+            Logging.Error($"could not read {path}; no mod will be allowed to load", ex);
+        }
+    }
+
+    /// <summary>
+    /// True when the assembly may load: either no allowlist is in force, or its
+    /// SHA-256 matches the entry for its file name.
+    /// </summary>
+    private bool IsAllowed(string assemblyPath)
+    {
+        if (_allowed is null)
+            return true;
+
+        string name = Path.GetFileName(assemblyPath);
+        if (!_allowed.TryGetValue(name, out string? expected))
+        {
+            Logging.Error($"{name} is not in the allowlist; not loading it");
+            return false;
+        }
+
+        string actual;
+        try
+        {
+            using FileStream stream = File.OpenRead(assemblyPath);
+            actual = Convert.ToHexString(SHA256.HashData(stream));
+        }
+        catch (Exception ex)
+        {
+            Logging.Error($"could not hash {assemblyPath}; not loading it", ex);
+            return false;
+        }
+
+        if (string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        Logging.Error($"{name} does not match the allowlist (expected {expected}, " +
+                      $"found {actual}); not loading it");
+        return false;
     }
 
     private void LoadFrom(string directory)
@@ -50,6 +140,9 @@ internal sealed class ModLoader
                 return;
             }
         }
+
+        if (!IsAllowed(assemblyPath))
+            return;
 
         Type[] types;
         try

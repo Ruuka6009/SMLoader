@@ -6,6 +6,17 @@ process by a small native shim.
 Nothing is installed into the Steam folder. No game file is renamed, patched or
 added, so *Verify integrity of game files* has nothing to undo.
 
+## Trust
+
+> Mods run as native code inside `ScrapMechanic.exe` with your user account's
+> full privileges. A mod can read and write any file you can, make network
+> connections, and modify any memory in the game. SMLoader does not sandbox
+> mods and cannot. Only install mods from sources you trust.
+
+That follows from what a mod loader is, rather than being a gap to close
+later - see [SECURITY.md](SECURITY.md), which also covers the mod allowlist,
+the `--no-mods` safe mode, and multiplayer and anti-cheat.
+
 ## How it works
 
 ```

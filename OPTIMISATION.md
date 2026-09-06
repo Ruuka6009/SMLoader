@@ -1205,7 +1205,7 @@ unrestricted read/write over the process, `PatchAsset` lets it redirect any file
 read, and assembly loading is unsandboxed by construction. That is a legitimate
 design for a mod loader — but it should be *stated*, not implied.
 
-### 6.1 [S] Document the trust model in the README and at first run
+### 6.1 [S] ~~Document the trust model in the README and at first run~~ — RESOLVED
 
 Add a `SECURITY.md` and a paragraph in the README:
 
@@ -1216,7 +1216,12 @@ Add a `SECURITY.md` and a paragraph in the README:
 
 Print the same warning once at load, listing the mods being loaded.
 
-### 6.2 [S] No integrity check on anything that gets loaded or injected
+Applied as `SECURITY.md`, a **Trust** section at the top of the README, and a
+line in `smloader.log` after `LoadAll` whenever any mod loaded. It is emitted
+every launch rather than once: a mod installed last week is still native code
+running with this user's privileges today.
+
+### 6.2 [S] ~~No integrity check on anything that gets loaded or injected~~ — RESOLVED, two of three
 
 - `Program.cs:38` takes `--dist <path>` and injects `<dist>/SMLoader.Shim.dll`
   into the game with no verification. A wrong or substituted `dist` folder is a
@@ -1232,6 +1237,23 @@ Minimum viable hardening:
   override for developers.
 - Add a `--no-mods` safe mode that boots the loader with zero mods, so a player
   can tell whether a crash is SMLoader or a mod.
+
+**`--no-mods` and the allowlist are done. Authenticode is not.**
+
+`--no-mods` and `--any-mod` reach the game through the environment, which the
+child inherits because `CreateProcessW` is called with a null environment block —
+the same route `SteamAppId` already took.
+
+`Mods/allowed.json` maps file name to expected SHA-256. A corrupt or unreadable
+allowlist refuses **everything** rather than falling back to loading anything: a
+broken allowlist must not be a way past the allowlist.
+
+In place of the shim signature check, the launcher now **refuses a `--dist`
+outside its own directory** unless `--allow-external-dist` is also given. That
+addresses the sentence this item actually makes — "a code-execution vector
+dressed up as a typo" — without pinning a hash that every local rebuild would
+invalidate. Verifying an Authenticode signature only becomes meaningful once
+there are signed releases to verify against.
 
 ### 6.3 [S] Command-line construction is not quote-safe
 
@@ -1288,7 +1310,7 @@ That last one is the important one, and it applies to `PatchGuard` too. Give
 `FindPattern` a variant that reports the match count, and refuse to patch on
 `> 1`.
 
-### 6.7 [S] MD5 for the cache key
+### 6.7 [S] ~~MD5 for the cache key~~ — RESOLVED with [§9.5](#95-q-analysers-are-off-and-warnings-are-not-errors), which flagged it as CA5351
 
 `src/SMLoader.Core/AssetPatcher.cs:116`. Not a security boundary — but it will
 trip every static analyser and every corporate scanner. `XxHash128` (in
@@ -1582,7 +1604,7 @@ and `vcs.xml` were in. Harmless in content, but IDE state does not belong in a
 repo shared with other contributors. Now untracked and covered by `.idea/` in
 `.gitignore`; the folder stays on disk so Rider keeps working.
 
-### 9.3 [Q] No `.editorconfig`
+### 9.3 [Q] ~~No `.editorconfig`~~ — RESOLVED with [§9.5](#95-q-analysers-are-off-and-warnings-are-not-errors)
 
 The code is written in a consistent, deliberate style — file-scoped namespaces,
 expression-bodied members where they fit, `var` only where the type is obvious.
@@ -1608,7 +1630,7 @@ different `net10.0` patch runtime.
 { "sdk": { "version": "10.0.300", "rollForward": "latestFeature" } }
 ```
 
-### 9.5 [Q] Analysers are off and warnings are not errors
+### 9.5 [Q] ~~Analysers are off and warnings are not errors~~ — RESOLVED
 
 `Directory.Build.props` sets language and platform properties but no analysis:
 
@@ -1623,6 +1645,32 @@ different `net10.0` patch runtime.
 
 CA1416 (platform compatibility) alone would flag every unguarded Win32 call in
 the cross-platform-targeting `SMLoader.Core`.
+
+**Applied, and the solution builds clean with warnings as errors.** The fallout
+was 170 diagnostics across five rules, and the split is the interesting part.
+
+**152 were wrong for this codebase** and are suppressed in a new `.editorconfig`
+(which also settles §9.3), each with its reason written next to it:
+
+- CA1707 and CA1401 on `LuaNative.cs` — it is the Lua 5.1 C API name for name,
+  and exposing those P/Invokes is the point rather than an oversight.
+- CA1716 on `SMLoader.Api` — `Get`, `Set` and `Declare` collide with Visual Basic
+  keywords, and mods are C#.
+
+**Three were real**, and are fixed rather than suppressed:
+
+- `Injector.cs` ignored `WaitForSingleObject`'s result, so `WAIT_FAILED` was
+  followed by reading an exit code for a thread it never actually waited on —
+  which reads as a successful injection.
+- `NoclipMod` ignored `GetWindowThreadProcessId`'s result, leaving `processId`
+  meaningless rather than merely wrong when the window vanishes between the two
+  calls.
+- `ModConfig` owned a `Timer` without being disposable (CA1001).
+
+CA5351 turned out to be §6.7, so the asset cache key is SHA-256 now.
+
+CA1416 never fired, because `Directory.Build.props` pins `win-x64` as the
+RuntimeIdentifier. §9.6 and §9.7 still stand on their own merits.
 
 ### 9.6 [Q] `SMLoader.Core` targets `net10.0` but is Windows-only
 
@@ -1779,7 +1827,7 @@ Add `dotnet format --verify-no-changes` and a `clang-format` check for the shim.
 
 ## 11. Observability
 
-### 11.1 [Q] There are no log levels
+### 11.1 [Q] ~~There are no log levels~~ — RESOLVED
 
 Everything goes through `Logging.Write` at one level. `script: {name}` — one line
 per distinct chunk, dozens per world load — sits alongside "boot failed". A
@@ -1792,6 +1840,11 @@ Logging.Write(LogLevel.Trace, $"script: {name}");
 ```
 
 Threshold from `SMLOADER_LOG_LEVEL`, defaulting to `Info`.
+
+Applied. `Info` prints unlabelled, so the common line keeps the shape it has
+always had and existing log-reading habits still work. `script: {name}` dropped
+to `Trace` and `lua_State 0x... available` to `Debug` — which is the third bullet
+of §2.8 finally landing.
 
 ### 11.2 [P] One writer, buffered, off the game thread
 
@@ -1894,13 +1947,17 @@ Next is hardening and tooling, starting at item 20.
 
 ### Then — hardening and tooling
 
-20. §6.1 / §6.2 State the trust model; add `--no-mods` and an integrity check
-21. §7.1 SEH-guard the PE header walk
+20. ~~§6.1 / §6.2 State the trust model; add `--no-mods` and an integrity check~~ —
+    done, except the Authenticode check, which needs signed releases before it
+    means anything; a `--dist` guard covers the vector the item describes
+21. ~~§7.1 SEH-guard the PE header walk~~ — done, as a prerequisite of §1.8
 22. ~~§7.7 Harden the shim's build flags; static CRT; PDB in Release~~ — done,
     minus `/WX` and `/Qspectre`; see the item for why
-23. §9.5 Turn analysers on and warnings into errors
+23. ~~§9.5 Turn analysers on and warnings into errors~~ — done, and §9.3 / §6.7
+    fell out of it
 24. §10 A test project, starting with the pure functions
-25. §11 Log levels and a single buffered writer
+25. ~~§11.1 Log levels~~ — done. §11.2, the single buffered writer, is still
+    open, and so are §11.3 rotation and §11.4 counters
 
 ### Longer term — design
 

@@ -989,7 +989,11 @@ public sealed class NoclipMod : IMod
         if (foreground == 0)
             return _focused = false;
 
-        GetWindowThreadProcessId(foreground, out uint processId);
+        // A zero return means the window went away between the two calls, and
+        // processId is then meaningless rather than merely wrong.
+        if (GetWindowThreadProcessId(foreground, out uint processId) == 0)
+            return _focused = false;
+
         return _focused = processId == (uint)Environment.ProcessId;
     }
 

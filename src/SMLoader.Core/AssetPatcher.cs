@@ -177,7 +177,11 @@ internal static class AssetPatcher
     /// </summary>
     private static string CachePathFor(string path)
     {
-        byte[] hash = MD5.HashData(Encoding.UTF8.GetBytes(path.ToLowerInvariant()));
+        // SHA-256 rather than MD5. Nothing here is a security boundary - this
+        // only has to turn a path into a stable folder name - but a broken hash
+        // in a loader is a thing to explain rather than a thing to have, and the
+        // result is cached per path so the cost is paid once.
+        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(path.ToLowerInvariant()));
         return Path.Combine(_cacheDirectory, Convert.ToHexString(hash)[..8], Path.GetFileName(path));
     }
 }

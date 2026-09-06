@@ -193,7 +193,7 @@ public static class Entry
         // into native code.
         try
         {
-            Logging.Write($"lua_State 0x{L:x} available");
+            Logging.Debug($"lua_State 0x{L:x} available");
             var lua = new LuaState(L);
 
             LuaStateCreated?.Invoke(lua);

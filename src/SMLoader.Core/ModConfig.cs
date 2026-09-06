@@ -5,7 +5,7 @@ using SMLoader.Api;
 namespace SMLoader.Core;
 
 /// <summary>JSON-backed <see cref="IModConfig"/>, one file per mod.</summary>
-internal sealed class ModConfig : IModConfig
+internal sealed class ModConfig : IModConfig, IDisposable
 {
     private static readonly JsonSerializerOptions Options = new()
     {
@@ -150,5 +150,17 @@ internal sealed class ModConfig : IModConfig
             return;
 
         Save();
+    }
+
+    /// <summary>
+    /// Flushes anything pending and stops the timer. Nothing calls this yet -
+    /// SMLoader has no shutdown path (OPTIMISATION.md 5.9) - but the timer is a
+    /// disposable this type owns, and the day mods can be unloaded this is where
+    /// the pending write has to land.
+    /// </summary>
+    public void Dispose()
+    {
+        _flushTimer.Dispose();
+        Flush();
     }
 }

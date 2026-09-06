@@ -1,0 +1,49 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+indent_style = space
+trim_trailing_whitespace = true
+
+[*.{cs,csproj,props,slnx}]
+indent_size = 4
+
+[*.{json,yml,yaml,md}]
+indent_size = 2
+
+[*.{cpp,h,txt}]
+indent_size = 4
+
+# ---------------------------------------------------------------------------
+# Analyser rules that are wrong for this codebase, with the reason. Anything
+# not listed here is on, and TreatWarningsAsErrors makes it stick.
+# ---------------------------------------------------------------------------
+
+[src/SMLoader.Api/Lua/LuaNative.cs]
+# CA1707 - identifiers should not contain underscores.
+# These are the Lua 5.1 C API, name for name. Renaming lua_gettop to LuaGetTop
+# would make every one of them a lookup against the Lua reference manual instead
+# of a match, which is the opposite of what this file is for.
+dotnet_diagnostic.CA1707.severity = none
+
+# CA1401 - P/Invokes should not be visible.
+# Deliberate: the raw Lua API is part of what SMLoader offers a mod. LuaState is
+# the comfortable layer over it, not a wall around it, and a mod doing something
+# the wrapper does not cover needs these.
+dotnet_diagnostic.CA1401.severity = none
+
+[src/SMLoader.Api/**.cs]
+# CA1716 - identifiers should not match keywords.
+# Get, Set and Declare collide with Visual Basic keywords. Mods are C#, and
+# renaming the config and settings API to suit a language nothing here uses
+# would make it worse for every actual consumer.
+dotnet_diagnostic.CA1716.severity = none
+
+[src/SMLoader.Launcher/Injector.cs]
+# CA1838 - avoid StringBuilder parameters for P/Invokes.
+# CreateProcessW needs a mutable command-line buffer. This runs once per launch,
+# so the marshalling cost the rule is about does not exist here. Worth revisiting
+# with the quoting fix in OPTIMISATION.md 6.3, which touches the same buffer.
+dotnet_diagnostic.CA1838.severity = none
