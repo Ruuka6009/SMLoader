@@ -10,13 +10,14 @@ namespace SMLoader.Core;
 /// </summary>
 internal static partial class GameConsole
 {
-    private static bool _ready;
+    private static int _ready;
 
     public static void Ensure()
     {
-        if (_ready)
+        // Interlocked, because two threads logging at once could otherwise both
+        // pass a plain check and both call AllocConsole.
+        if (Interlocked.Exchange(ref _ready, 1) != 0)
             return;
-        _ready = true;
 
         try
         {

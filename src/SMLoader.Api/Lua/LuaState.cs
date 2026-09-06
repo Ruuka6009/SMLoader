@@ -83,6 +83,15 @@ public readonly struct LuaState
     public void Pop(int count = 1)    => lua_pop(Handle, count);
     public void NewTable()            => lua_createtable(Handle, 0, 0);
 
+    /// <summary>
+    /// Ensures room for <paramref name="count"/> more values, returning false if the
+    /// stack cannot grow. Lua guarantees LUA_MINSTACK (20) free slots on entry
+    /// to a C function, so a fixed handful of pushes is safe without this - but
+    /// anything pushing a variable number is not, and overflowing the Lua stack
+    /// corrupts the VM rather than raising anything catchable.
+    /// </summary>
+    public bool EnsureStack(int count) => lua_checkstack(Handle, count) != 0;
+
     public void Push(string value)
     {
         byte[] utf8 = Encoding.UTF8.GetBytes(value);

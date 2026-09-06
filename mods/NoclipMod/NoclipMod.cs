@@ -325,12 +325,26 @@ public sealed class NoclipMod : IMod
                     // original bytes - which is what leaves them intact. Zeroing
                     // those offsets writes raw coordinates over the pointers and
                     // freezes the camera.
-                    _renderOffset = new Vector3(
-                        host.Memory.Read<float>(body + RenderMirror + 0) - host.Memory.Read<float>(body + PositionOffset + 0),
-                        host.Memory.Read<float>(body + RenderMirror + 4) - host.Memory.Read<float>(body + PositionOffset + 4),
-                        host.Memory.Read<float>(body + RenderMirror + 8) - host.Memory.Read<float>(body + PositionOffset + 8));
+                    var mirror = new Vector3(
+                        host.Memory.Read<float>(body + RenderMirror + 0),
+                        host.Memory.Read<float>(body + RenderMirror + 4),
+                        host.Memory.Read<float>(body + RenderMirror + 8));
 
-                    host.Log($"render offset ({_renderOffset.X:E2}, {_renderOffset.Y:E2}, {_renderOffset.Z:F3})");
+                    var position = new Vector3(
+                        host.Memory.Read<float>(body + PositionOffset + 0),
+                        host.Memory.Read<float>(body + PositionOffset + 4),
+                        host.Memory.Read<float>(body + PositionOffset + 8));
+
+                    _renderOffset = mirror - position;
+
+                    // The raw values, not just their difference. An offset alone
+                    // cannot distinguish "the mirror holds something else" from
+                    // "the read failed and returned zero", and those need opposite
+                    // fixes - a distinction that cost two wrong diagnoses.
+                    host.Log($"render offset ({_renderOffset.X:E2}, {_renderOffset.Y:E2}, {_renderOffset.Z:F3})" +
+                             $" [body 0x{body:X}, mirror ({mirror.X:F3}, {mirror.Y:F3}, {mirror.Z:F3}),"
+                             + $" position ({position.X:F3}, {position.Y:F3}, {position.Z:F3}),"
+                             + $" readable {host.Memory.IsReadable(body + RenderMirror, 12)}]");
                 }
             }
 
