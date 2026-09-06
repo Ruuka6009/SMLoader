@@ -12,5 +12,18 @@ public interface IModConfig
     /// <summary>Writes a value in memory. Call <see cref="Save"/> to persist it.</summary>
     void Set<T>(string key, T value);
 
+    /// <summary>Persists the file now, synchronously.</summary>
     void Save();
+
+    /// <summary>
+    /// Asks for the file to be persisted shortly, coalescing with any other
+    /// request made in the same window. Use this from anything the player can
+    /// repeat quickly - a stepper button, a slider - where a synchronous write
+    /// per change is a frame spike on the game thread.
+    /// </summary>
+    /// <remarks>
+    /// The default implementation simply saves, so an existing
+    /// <see cref="IModConfig"/> needs no change.
+    /// </remarks>
+    void SaveDeferred() => Save();
 }

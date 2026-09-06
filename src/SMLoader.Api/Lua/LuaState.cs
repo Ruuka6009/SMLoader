@@ -17,8 +17,14 @@ public delegate int LuaFunction(LuaState lua);
 /// a <see cref="LuaState"/> from inside a callback Lua invoked on you, or from a
 /// hook you know runs on the game's script thread. Calling in from a worker
 /// thread will corrupt the VM.
+/// <para>
+/// A value type on purpose. It wraps one pointer, and a mod's Lua can call in
+/// ten times per rendered frame - as a class that was ~1,500 allocations a
+/// second at 144 fps, purely to carry an <c>nint</c>, and the gen-0 collection
+/// it eventually forces is the kind of hitch a player reads as stutter.
+/// </para>
 /// </remarks>
-public sealed class LuaState
+public readonly struct LuaState
 {
     // Keyed on the delegate itself, by reference. Minting a fresh id per push
     // meant a function pushed into ten states per world load cost ten permanent

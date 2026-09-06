@@ -346,7 +346,7 @@ Three paths matter, in order: **`CreateFileW`** (every file the process opens),
 **`client_onUpdate` → `smloader.*`** (every rendered frame), and
 **`luaL_loadbufferx`** (every script compile, ~10× per world load per script).
 
-### 2.1 [P] `new LuaState(L)` allocates on every Lua→C# call
+### 2.1 [P] ~~`new LuaState(L)` allocates on every Lua→C# call~~ — RESOLVED
 
 `src/SMLoader.Api/Lua/LuaState.cs:21,153`
 
@@ -370,6 +370,11 @@ public readonly struct LuaState(nint handle)
 `LuaFunction` stays `delegate int LuaFunction(LuaState lua)` unchanged, and the
 trampoline allocates nothing. If a reference type is required for API reasons,
 cache one instance per `lua_State` in a `[ThreadStatic]` field instead.
+
+**RESOLVED** as a `readonly struct`. Nothing in the tree compared a `LuaState`
+to null or used `LuaState?`, so no call site changed — but it *is* a source-
+breaking change for any mod that did, which nothing outside this repository has
+had the chance to do yet.
 
 ### 2.2 [P] Every memory read costs a `VirtualQuery`
 
@@ -404,7 +409,7 @@ public interface IMemoryRegion
 }
 ```
 
-### 2.3 [P] `IsGameFocused()` makes two USER32 calls per key check
+### 2.3 [P] ~~`IsGameFocused()` makes two USER32 calls per key check~~ — RESOLVED
 
 `mods/NoclipMod/NoclipMod.cs:118-125` and the `IsGameFocused` helper
 
@@ -427,10 +432,14 @@ private static bool IsGameFocused()
 }
 ```
 
-Better still: expose a single `smloader.readKeys(vk1, vk2, ...)` returning a
-bitmask, so one managed call covers the whole frame's input.
+Applied with the 100ms stamp exactly as sketched.
 
-### 2.4 [P] `smloader.noclipKey()` deserialises JSON every fixed tick
+The `smloader.readKeys(vk1, vk2, ...)` bitmask is still worth doing — it would
+collapse the six remaining per-frame managed calls into one — but it changes the
+injected Lua as well as the binding, so it is left for the §8.9 pass over the
+injected script.
+
+### 2.4 [P] ~~`smloader.noclipKey()` deserialises JSON every fixed tick~~ — RESOLVED
 
 `mods/NoclipMod/NoclipMod.cs:154-158`, `src/SMLoader.Core/ModConfig.cs:45-61`
 
@@ -456,7 +465,17 @@ host.Settings.Changed += key =>
 The same applies inside `ModConfig`: hold a `Dictionary<string, object?>` of
 already-materialised values alongside the `JsonElement` map.
 
-### 2.5 [P] Every setting write does a synchronous full-file JSON serialise
+**RESOLVED at both levels.** NoclipMod caches `_noclipKey` and `_noclipSpeed`,
+primed in `OnLoad` and refreshed from `IModSettings.Changed`, and its own setters
+update the field alongside the config. `ModConfig` holds a
+`Dictionary<string, (Type, object?)>` beside the `JsonElement` map, keyed by
+requested type so `Get<int>` and `Get<double>` on one key cannot collide.
+
+That cache also settles [§5.6](#56-e-gett-swallows-the-deserialisation-error-silently):
+a failed deserialise is now logged with the key and the expected type, and the
+fallback is cached, so it reports once rather than on every read.
+
+### 2.5 [P] ~~Every setting write does a synchronous full-file JSON serialise~~ — RESOLVED
 
 `src/SMLoader.Core/ModSettings.cs:33-34,76`
 
@@ -469,7 +488,22 @@ click handler is a guaranteed frame spike.
 - Expose `IModConfig.SaveAsync()`; make `Save()` the explicit-flush escape hatch.
 - Batch `Declare` — one save after `ModLoader.LoadAll` completes.
 
-### 2.6 [P] Script transforms re-run on every compile with no caching
+**RESOLVED**, with one deliberate difference: `Save()` keeps meaning *persist
+now*, and the new coalescing path is `IModConfig.SaveDeferred()`. Quietly making
+`Save()` asynchronous would have changed what an existing caller's durability
+guarantee is worth without telling it.
+
+`SaveDeferred` is a **default interface method** that just calls `Save()`, so it
+is additive — an existing `IModConfig` implementation needs no change.
+`ModConfig` overrides it with a one-second coalescing timer plus a `ProcessExit`
+flush, which is best effort only: a force-quit never reaches it, which is why the
+window is short and the write itself is atomic (§5.5).
+
+`Declare` and the panel's writes both use it, so declaring N settings at startup
+is one write rather than N, and a run of stepper clicks is one write rather than
+one per click.
+
+### 2.6 [P] ~~Script transforms re-run on every compile with no caching~~ — RESOLVED
 
 `src/SMLoader.Core/ScriptPatcher.cs:44-82` and `Entry.cs:169-201`
 
@@ -491,7 +525,21 @@ private static readonly ConcurrentDictionary<(string Name, ulong Hash), byte[]> 
 Return the cached UTF-8 bytes directly and skip the decode/encode round trip
 entirely on a hit.
 
-### 2.7 [P] `ScriptLoadContext.Append` is O(n) string concatenation
+**RESOLVED.** `ScriptPatcher.Apply` now takes a `ReadOnlySpan<byte>` and returns
+`byte[]?`, and `Entry.OnScriptLoading` hands it the engine's own buffer, so a hit
+costs one hash of the bytes and nothing else — no decode, no transform, no
+re-encode, no allocation beyond the chunk name.
+
+`XxHash3` would have meant shipping `System.IO.Hashing` next to the loader for
+one function, so the hash is FNV-1a over the bytes, mixed with the length. It is
+not a security hash and does not need to be: the chunk name is part of the key
+and the input is one build of one game script.
+
+A rewrite that lands back on the original bytes is compared with
+`SequenceEqual` and reported as "no change", so the engine still compiles its own
+buffer in that case.
+
+### 2.7 [P] ~~`ScriptLoadContext.Append` is O(n) string concatenation~~ — RESOLVED
 
 `src/SMLoader.Api/ScriptPatch.cs:26-29`
 
@@ -513,7 +561,17 @@ public string Source
 public void Append(string lua) => (_builder ??= new StringBuilder(_source)).Append('\n').Append(lua).Append('\n');
 ```
 
-### 2.8 [P] `ScriptPatcher.WantsScript` locks and logs on every compile
+**RESOLVED**, and it needed one thing the sketch does not show. `ScriptPatcher`
+read `context.Source` before and after every registration to detect a change —
+which materialises the builder between each mod's turn and reinstates exactly the
+quadratic cost being removed.
+
+So `ScriptLoadContext` also exposes `Revision` (mutations so far) and `Length`,
+neither of which flattens the builder, and the patcher compares those instead.
+`Prepend` moved onto the builder as an `Insert(0, ...)` rather than a
+concatenation for the same reason.
+
+### 2.8 [P] ~~`ScriptPatcher.WantsScript` locks and logs on every compile~~ — RESOLVED
 
 `src/SMLoader.Core/ScriptPatcher.cs:27-41`
 
@@ -528,7 +586,17 @@ first time each name is seen.
   `AssetPatcher.Resolve` already does exactly this — copy the pattern.
 - Demote the `script: {name}` line to a verbose level (§11.1).
 
-### 2.9 [P] `RedirectFileOpen` takes a global mutex on every file open in the process
+First two applied as described. The third waits on §11.1, so in the meantime the
+line is **bounded** rather than demoted: the unbounded `SeenScripts` set is gone,
+replaced by a cap of 256 distinct names, after which the names stop being
+recorded. That also closes [§3.7](#37-e-seenscripts-grows-without-bound), and the
+line is worth keeping until there is a verbose level, because it is how a mod
+author finds a chunk name in the first place.
+
+Note the consequence of the early-out: with no registrations, nothing is logged
+at all. Discovery now requires at least one registration to exist.
+
+### 2.9 [P] ~~`RedirectFileOpen` takes a global mutex on every file open in the process~~ — RESOLVED
 
 `src/SMLoader.Shim/dllmain.cpp:153-164`
 
@@ -550,6 +618,17 @@ std::atomic<FileOpenCallback> g_fileOpen{nullptr};
 // write:  g_fileOpen.store(cb, std::memory_order_release);
 // read:   auto cb = g_fileOpen.load(std::memory_order_acquire);
 ```
+
+**RESOLVED** for all seven callbacks, and `g_scriptMutex` is gone entirely.
+
+`g_stateMutex` stays, because it guards `g_pendingStates`, which is a real
+container with a real invariant. Two places still take it and both need to:
+`OnLuaStateCreated`, where the decision to queue has to be atomic with the push
+or a state is dropped between them, and `OnLuaStateClosing`, which erases from
+the same vector.
+
+`SetScriptLoadCallback` stores `free` before `load`, so a transform can never be
+handed out before the function that releases it is visible.
 
 ### 2.10 [P] Managed code runs inside `CreateFileW`, on arbitrary threads
 
@@ -574,7 +653,7 @@ Even a crude filter — "does the path contain `\Data\` and end in `.layout`,
 `.json` or `.lua`" — removes DLL loads, save files, shader caches and the
 loader's own log from the managed path entirely.
 
-### 2.11 [P] `InputScanner.FirstPressedKey` makes 247 syscalls per call
+### 2.11 [P] ~~`InputScanner.FirstPressedKey` makes 247 syscalls per call~~ — RESOLVED
 
 `src/SMLoader.Core/InputScanner.cs:12-23`
 
@@ -592,7 +671,10 @@ return 0;
 Note `GetKeyboardState` reflects the calling thread's message queue, so it must
 run on the game's UI thread — which the panel poll already does.
 
-### 2.12 [P] `[SuppressGCTransition]` on the trivial Lua bindings
+Applied verbatim, with that constraint written into the comment at the call site
+so the next person to move this code knows what breaks.
+
+### 2.12 [P] ~~`[SuppressGCTransition]` on the trivial Lua bindings~~ — RESOLVED
 
 `src/SMLoader.Api/Lua/LuaNative.cs`
 
@@ -613,6 +695,12 @@ Do **not** apply it to `lua_pcall`, `luaL_loadstring`, `lua_gettable`,
 `lua_settable`, `lua_setfield`, `lua_getfield` or anything that can invoke a
 metamethod, run Lua code, raise an error, or block — those can take arbitrarily
 long and must stay preemptible.
+
+**RESOLVED**, and `lua_remove`, `lua_insert` and `lua_checkstack` were added to
+the list — each is stack bookkeeping with the same profile. `lua_tolstring` is
+deliberately **not** annotated even though it sits among the `lua_to*` family: it
+converts a number in place and can allocate the string. That exclusion is now a
+comment in the file rather than something to rediscover.
 
 ### 2.13 [P] `LuaState.Push(string)` allocates a byte array per push
 
@@ -803,7 +891,7 @@ that is never drained. Cap it (16 is generous) and log once when the cap is hit.
 `new MemoryStream(bytes, writable: false)` avoids one copy. The streams are
 correctly disposed after `LoadFromStream` returns.
 
-### 3.7 [E] `SeenScripts` grows without bound
+### 3.7 [E] ~~`SeenScripts` grows without bound~~ — RESOLVED with [§2.8](#28-p-scriptpatcherwantsscript-locks-and-logs-on-every-compile)
 
 `src/SMLoader.Core/ScriptPatcher.cs:14`. Bounded in practice by the number of
 distinct chunk names, but a dynamically generated chunk name would not be. Cap
@@ -992,7 +1080,7 @@ File.Move(temp, _path, overwrite: true);   // atomic rename on NTFS
 Applied, with the temp file deleted on a failed write so a full disk does not
 leave `.tmp` files accumulating beside the configs.
 
-### 5.6 [E] `Get<T>` swallows the deserialisation error silently
+### 5.6 [E] ~~`Get<T>` swallows the deserialisation error silently~~ — RESOLVED with [§2.4](#24-p-smloadernoclipkey-deserialises-json-every-fixed-tick)
 
 `src/SMLoader.Core/ModConfig.cs:56-59` — `catch { return fallback; }`. A setting
 that quietly reverts to its default every launch is very hard to diagnose. Log
@@ -1713,14 +1801,17 @@ Next up is the performance block, starting at §2.1.
 
 ### Then — performance, in descending order of expected win
 
-12. §2.1 `LuaState` as a struct (removes ~10 allocations per frame)
+12. ~~§2.1 `LuaState` as a struct (removes ~10 allocations per frame)~~ — done
 13. §2.2 Region-cached or handle-based memory access (removes ~4,000 syscalls/s)
 14. §2.10 Native prefilter before entering managed code on `CreateFileW`
-15. §2.6 Cache patched script output by content hash
-16. §2.4 / §2.5 Cache typed settings; debounce config saves
-17. §2.3 / §2.11 Batch input polling
-18. §2.12 `[SuppressGCTransition]` on the trivial Lua bindings
-19. §2.9 Atomics instead of mutexes for the write-once callbacks
+15. ~~§2.6 Cache patched script output by content hash~~ — done, and §2.7 / §2.8
+    with it, since the change detection they share had to move off `Source`
+16. ~~§2.4 / §2.5 Cache typed settings; debounce config saves~~ — done, and §5.6
+17. ~~§2.3 / §2.11 Batch input polling~~ — done for the focus check and the
+    keyboard scan; the `readKeys` bitmask is left with §8.9
+18. ~~§2.12 `[SuppressGCTransition]` on the trivial Lua bindings~~ — done
+19. ~~§2.9 Atomics instead of mutexes for the write-once callbacks~~ — done, and
+    §3.7 fell out of §2.8
 
 ### Then — hardening and tooling
 

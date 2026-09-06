@@ -27,6 +27,13 @@ public sealed class NoclipMod : IMod
     public string Version => "1.1.0";
 
     private bool _enabled;
+
+    // Cached because Lua asks for these constantly - noclipKey every fixed
+    // tick at 40 Hz, noclipSpeed every rendered frame while flying - and each
+    // Config.Get was a lock plus a full System.Text.Json converter dispatch.
+    // Kept current from IModSettings.Changed rather than re-read.
+    private int _noclipKey = DefaultKey;
+    private double _noclipSpeed = DefaultSpeed;
     private nint _character;        // server-side character
     private nint _clientCharacter;  // client-side copy; this is the one rendered
 
@@ -112,8 +119,18 @@ public sealed class NoclipMod : IMod
             Step = 0.05,
         });
 
-        host.Log($"toggle key 0x{host.Config.Get(KeyOption, DefaultKey):X2}, " +
-                 $"speed {host.Config.Get(SpeedOption, DefaultSpeed)}");
+        _noclipKey = host.Config.Get(KeyOption, DefaultKey);
+        _noclipSpeed = host.Config.Get(SpeedOption, DefaultSpeed);
+
+        host.Settings.Changed += key =>
+        {
+            if (string.Equals(key, KeyOption, StringComparison.OrdinalIgnoreCase))
+                _noclipKey = host.Config.Get(KeyOption, DefaultKey);
+            else if (string.Equals(key, SpeedOption, StringComparison.OrdinalIgnoreCase))
+                _noclipSpeed = host.Config.Get(SpeedOption, DefaultSpeed);
+        };
+
+        host.Log($"toggle key 0x{_noclipKey:X2}, speed {_noclipSpeed}");
 
         host.AddLuaFunction("isKeyDown", lua =>
         {
@@ -153,15 +170,16 @@ public sealed class NoclipMod : IMod
 
         host.AddLuaFunction("noclipKey", lua =>
         {
-            lua.Push((long)host.Config.Get(KeyOption, DefaultKey));
+            lua.Push((long)_noclipKey);
             return 1;
         });
 
         host.AddLuaFunction("setNoclipKey", lua =>
         {
             int key = (int)lua.ToInteger(1);
+            _noclipKey = key;
             host.Config.Set(KeyOption, key);
-            host.Config.Save();
+            host.Config.SaveDeferred();
             host.Log($"toggle key saved as 0x{key:X2}");
             lua.Push((long)key);
             return 1;
@@ -204,15 +222,16 @@ public sealed class NoclipMod : IMod
 
         host.AddLuaFunction("noclipSpeed", lua =>
         {
-            lua.Push(host.Config.Get(SpeedOption, DefaultSpeed));
+            lua.Push(_noclipSpeed);
             return 1;
         });
 
         host.AddLuaFunction("setNoclipSpeed", lua =>
         {
             double speed = Math.Clamp(lua.ToNumber(1), 0.05, 5.0);
+            _noclipSpeed = speed;
             host.Config.Set(SpeedOption, speed);
-            host.Config.Save();
+            host.Config.SaveDeferred();
             host.Log($"speed saved as {speed}");
             lua.Push(speed);
             return 1;
@@ -949,14 +968,29 @@ public sealed class NoclipMod : IMod
     /// True only while the game window has focus. Keyboard state is read
     /// process-wide, so every key check has to be gated on this.
     /// </summary>
+    private static uint _focusStamp;
+    private static bool _focused;
+
+    /// <summary>
+    /// Whether the game owns the foreground window, recomputed at most every
+    /// 100ms. isKeyDown asks per key per frame - six movement keys plus the
+    /// toggle - so this was ~14 window-manager round trips a frame for a value
+    /// that changes when the player alt-tabs.
+    /// </summary>
     private static bool IsGameFocused()
     {
+        uint now = (uint)Environment.TickCount;
+        if (now - _focusStamp < 100)
+            return _focused;
+
+        _focusStamp = now;
+
         nint foreground = GetForegroundWindow();
         if (foreground == 0)
-            return false;
+            return _focused = false;
 
         GetWindowThreadProcessId(foreground, out uint processId);
-        return processId == (uint)Environment.ProcessId;
+        return _focused = processId == (uint)Environment.ProcessId;
     }
 
     [DllImport("user32.dll")]

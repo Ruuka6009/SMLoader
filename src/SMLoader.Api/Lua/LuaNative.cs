@@ -29,30 +29,42 @@ public static partial class LuaNative
     public static int UpvalueIndex(int i) => LUA_GLOBALSINDEX - i;
 
     // ---- stack ------------------------------------------------------------
+    //
+    // [SuppressGCTransition] on the entries below: each is a handful of
+    // instructions with no allocation, no blocking and no callback into managed
+    // code, which is the exact profile the attribute exists for. It drops the
+    // cooperative -> preemptive GC mode transition, most of the cost of a
+    // P/Invoke this small. It is deliberately NOT on lua_pcall, luaL_loadstring,
+    // lua_gettable/settable, lua_getfield/setfield, lua_tolstring or anything
+    // else that can run Lua, fire a metamethod, allocate, raise an error or
+    // block - those must stay preemptible.
 
-    [LibraryImport(Lib)] public static partial int  lua_gettop(nint L);
-    [LibraryImport(Lib)] public static partial void lua_settop(nint L, int index);
-    [LibraryImport(Lib)] public static partial void lua_pushvalue(nint L, int index);
-    [LibraryImport(Lib)] public static partial void lua_remove(nint L, int index);
-    [LibraryImport(Lib)] public static partial void lua_insert(nint L, int index);
-    [LibraryImport(Lib)] public static partial int  lua_checkstack(nint L, int extra);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial int  lua_gettop(nint L);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial void lua_settop(nint L, int index);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial void lua_pushvalue(nint L, int index);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial void lua_remove(nint L, int index);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial void lua_insert(nint L, int index);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial int  lua_checkstack(nint L, int extra);
 
     // ---- type inspection --------------------------------------------------
 
-    [LibraryImport(Lib)] public static partial int  lua_type(nint L, int index);
-    [LibraryImport(Lib)] public static partial nint lua_typename(nint L, int type);
-    [LibraryImport(Lib)] public static partial int  lua_toboolean(nint L, int index);
-    [LibraryImport(Lib)] public static partial double lua_tonumber(nint L, int index);
-    [LibraryImport(Lib)] public static partial nint lua_tointeger(nint L, int index);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial int  lua_type(nint L, int index);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial nint lua_typename(nint L, int type);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial int  lua_toboolean(nint L, int index);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial double lua_tonumber(nint L, int index);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial nint lua_tointeger(nint L, int index);
+
+    // Not suppressed: converts a number in place and can allocate the string.
     [LibraryImport(Lib)] public static partial nint lua_tolstring(nint L, int index, out nuint len);
-    [LibraryImport(Lib)] public static partial nuint lua_objlen(nint L, int index);
+
+    [LibraryImport(Lib), SuppressGCTransition] public static partial nuint lua_objlen(nint L, int index);
 
     // ---- push -------------------------------------------------------------
 
-    [LibraryImport(Lib)] public static partial void lua_pushnil(nint L);
-    [LibraryImport(Lib)] public static partial void lua_pushnumber(nint L, double n);
-    [LibraryImport(Lib)] public static partial void lua_pushinteger(nint L, nint n);
-    [LibraryImport(Lib)] public static partial void lua_pushboolean(nint L, int b);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial void lua_pushnil(nint L);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial void lua_pushnumber(nint L, double n);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial void lua_pushinteger(nint L, nint n);
+    [LibraryImport(Lib), SuppressGCTransition] public static partial void lua_pushboolean(nint L, int b);
     [LibraryImport(Lib)] public static partial void lua_pushlstring(nint L, nint s, nuint len);
     [LibraryImport(Lib)] public static partial void lua_pushcclosure(nint L, nint fn, int n);
 

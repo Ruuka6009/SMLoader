@@ -31,7 +31,10 @@ internal sealed class ModSettings : IModSettings
         // discoverable and the panel always has something to show.
         T current = _config.Get(setting.Key, (T)Convert.ChangeType(setting.Default, typeof(T)));
         _config.Set(setting.Key, current);
-        _config.Save();
+
+        // Deferred, so declaring N settings at startup is one file write
+        // rather than N.
+        _config.SaveDeferred();
 
         SettingsRegistry.Register(new ModSettingEntry(
             _modName,
@@ -73,7 +76,9 @@ internal sealed class ModSettings : IModSettings
                 break;
         }
 
-        _config.Save();
+        // Deferred: this runs on the game thread, from a panel click the
+        // player can repeat as fast as they can press it.
+        _config.SaveDeferred();
         Logging.Write($"[{_modName}] setting '{setting.Key}' -> {value}");
 
         try
@@ -98,7 +103,7 @@ internal sealed class ModSettings : IModSettings
         if (setting is null)
         {
             _config.Set(key, value);
-            _config.Save();
+            _config.SaveDeferred();
             return;
         }
 

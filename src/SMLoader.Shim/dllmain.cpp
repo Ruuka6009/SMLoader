@@ -3,6 +3,7 @@
 #include "clr_host.h"
 #include "log.h"
 
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -13,19 +14,25 @@ HMODULE g_selfModule = nullptr;
 
 namespace {
 
+// g_stateMutex still guards g_pendingStates, which is a real container with a
+// real invariant. The callbacks below are write-once pointers read from the
+// hottest paths the shim touches - RedirectFileOpen runs on every file open in
+// the process - so they are atomics instead. A process-wide mutex to read one
+// pointer bounces that cache line between cores under the engine's concurrent
+// asset streaming, for no ordering that acquire/release does not already give.
 std::mutex               g_stateMutex;
 std::vector<void*>       g_pendingStates;   // seen before the CLR was ready
-LuaStateCallback         g_callback = nullptr;
 std::wstring             g_rootDir;
 volatile long            g_stateCount = 0;
-LuaReadyCallback         g_readyCallback = nullptr;
 volatile long            g_readyDone = 0;
-ScriptLoadCallback       g_scriptLoad = nullptr;
-ScriptFreeCallback       g_scriptFree = nullptr;
-SetFenvCallback          g_setFenv = nullptr;
-FileOpenCallback         g_fileOpen = nullptr;
-LuaCloseCallback         g_closeCallback = nullptr;
-std::mutex               g_scriptMutex;
+
+std::atomic<LuaStateCallback>   g_callback{nullptr};
+std::atomic<LuaReadyCallback>   g_readyCallback{nullptr};
+std::atomic<ScriptLoadCallback> g_scriptLoad{nullptr};
+std::atomic<ScriptFreeCallback> g_scriptFree{nullptr};
+std::atomic<SetFenvCallback>    g_setFenv{nullptr};
+std::atomic<FileOpenCallback>   g_fileOpen{nullptr};
+std::atomic<LuaCloseCallback>   g_closeCallback{nullptr};
 
 } // namespace
 
@@ -53,47 +60,46 @@ int SeenStateCount()
 void OnLuaStateCreated(void* L)
 {
     InterlockedIncrement(&g_stateCount);
+
+    // Still under the lock: the decision to queue has to be atomic with the
+    // push, or a state can be dropped between the two.
     LuaStateCallback callback = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
-        if (!g_callback)
+        callback = g_callback.load(std::memory_order_acquire);
+        if (!callback)
         {
             // The CLR has not booted yet; replay this state once it has.
             g_pendingStates.push_back(L);
             return;
         }
-        callback = g_callback;
     }
     callback(L);
 }
 
 void SetLuaCloseCallback(LuaCloseCallback cb)
 {
-    std::lock_guard<std::mutex> lock(g_stateMutex);
-    g_closeCallback = cb;
+    g_closeCallback.store(cb, std::memory_order_release);
     SMLOG("lua_State teardown callback installed");
 }
 
 void OnLuaStateClosing(void* L)
 {
-    LuaCloseCallback callback = nullptr;
     {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        callback = g_closeCallback;
-
         // A state queued for replay is about to stop existing; drop it so the
         // managed side is never handed a dangling lua_State*.
+        std::lock_guard<std::mutex> lock(g_stateMutex);
         for (auto it = g_pendingStates.begin(); it != g_pendingStates.end(); )
             it = (*it == L) ? g_pendingStates.erase(it) : it + 1;
     }
-    if (callback)
+
+    if (LuaCloseCallback callback = g_closeCallback.load(std::memory_order_acquire))
         callback(L);
 }
 
 void SetLuaReadyCallback(LuaReadyCallback cb)
 {
-    std::lock_guard<std::mutex> lock(g_stateMutex);
-    g_readyCallback = cb;
+    g_readyCallback.store(cb, std::memory_order_release);
 }
 
 bool NotifyLuaRunning(void* L)
@@ -101,11 +107,7 @@ bool NotifyLuaRunning(void* L)
     if (g_readyDone)
         return true;
 
-    LuaReadyCallback callback = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        callback = g_readyCallback;
-    }
+    LuaReadyCallback callback = g_readyCallback.load(std::memory_order_acquire);
     if (!callback)
         return false;
 
@@ -118,20 +120,17 @@ bool NotifyLuaRunning(void* L)
 
 void SetScriptLoadCallback(ScriptLoadCallback load, ScriptFreeCallback free)
 {
-    std::lock_guard<std::mutex> lock(g_scriptMutex);
-    g_scriptLoad = load;
-    g_scriptFree = free;
+    // free first, so a transform can never be handed out before the thing that
+    // releases it is visible.
+    g_scriptFree.store(free, std::memory_order_release);
+    g_scriptLoad.store(load, std::memory_order_release);
     SMLOG("script transform callback installed");
 }
 
 bool TransformScript(const char* name, const char* source, size_t length,
                      const char** outSource, size_t* outLength)
 {
-    ScriptLoadCallback callback = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_scriptMutex);
-        callback = g_scriptLoad;
-    }
+    ScriptLoadCallback callback = g_scriptLoad.load(std::memory_order_acquire);
     if (!callback || !source)
         return false;
 
@@ -140,47 +139,32 @@ bool TransformScript(const char* name, const char* source, size_t length,
 
 void ReleaseScriptSource(const char* buffer)
 {
-    ScriptFreeCallback callback = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_scriptMutex);
-        callback = g_scriptFree;
-    }
+    ScriptFreeCallback callback = g_scriptFree.load(std::memory_order_acquire);
     if (callback && buffer)
         callback(buffer);
 }
 
 void SetSetFenvCallback(SetFenvCallback cb)
 {
-    std::lock_guard<std::mutex> lock(g_scriptMutex);
-    g_setFenv = cb;
+    g_setFenv.store(cb, std::memory_order_release);
     SMLOG("script environment seeding enabled");
 }
 
 void SeedScriptEnvironment(void* L)
 {
-    SetFenvCallback callback = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_scriptMutex);
-        callback = g_setFenv;
-    }
-    if (callback)
+    if (SetFenvCallback callback = g_setFenv.load(std::memory_order_acquire))
         callback(L);
 }
 
 void SetFileOpenCallback(FileOpenCallback cb)
 {
-    std::lock_guard<std::mutex> lock(g_scriptMutex);
-    g_fileOpen = cb;
+    g_fileOpen.store(cb, std::memory_order_release);
     SMLOG("asset redirection enabled");
 }
 
 bool RedirectFileOpen(const wchar_t* path, wchar_t* out, int outChars)
 {
-    FileOpenCallback callback = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_scriptMutex);
-        callback = g_fileOpen;
-    }
+    FileOpenCallback callback = g_fileOpen.load(std::memory_order_acquire);
     if (!callback || !path)
         return false;
 
@@ -192,7 +176,7 @@ void SetLuaStateCallback(LuaStateCallback cb)
     std::vector<void*> replay;
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
-        g_callback = cb;
+        g_callback.store(cb, std::memory_order_release);
         replay.swap(g_pendingStates);
     }
 

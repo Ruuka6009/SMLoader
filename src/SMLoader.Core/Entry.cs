@@ -243,17 +243,18 @@ public static class Entry
             if (length == 0 || ((byte*)sourcePtr)[0] == 0x1B)
                 return 0;
 
-            string source = Encoding.UTF8.GetString((byte*)sourcePtr, checked((int)length));
-            string? patched = ScriptPatcher.Apply(name, source);
+            // Handed to the patcher as bytes: on a cache hit it answers from the
+            // hash alone, with no UTF-8 decode and no re-encode at all.
+            var source = new ReadOnlySpan<byte>((void*)sourcePtr, checked((int)length));
+            byte[]? patched = ScriptPatcher.Apply(name, source);
             if (patched is null)
                 return 0;
 
-            byte[] bytes = Encoding.UTF8.GetBytes(patched);
-            nint buffer = Marshal.AllocHGlobal(bytes.Length);
-            Marshal.Copy(bytes, 0, buffer, bytes.Length);
+            nint buffer = Marshal.AllocHGlobal(patched.Length);
+            Marshal.Copy(patched, 0, buffer, patched.Length);
 
             *outSource = buffer;
-            *outLength = (nuint)bytes.Length;
+            *outLength = (nuint)patched.Length;
             return 1;
         }
         catch (Exception ex)

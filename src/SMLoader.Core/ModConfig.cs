@@ -13,15 +13,38 @@ internal sealed class ModConfig : IModConfig
         DefaultIgnoreCondition = JsonIgnoreCondition.Never,
     };
 
+    /// <summary>
+    /// How long a <see cref="SaveDeferred"/> waits for company. Long enough to
+    /// collapse a run of stepper clicks and the startup burst of declarations,
+    /// short enough that a crash cannot lose much.
+    /// </summary>
+    private const int FlushDelayMs = 1000;
+
     private readonly string _path;
     private readonly Dictionary<string, JsonElement> _values;
+
+    /// <summary>
+    /// Values already materialised out of JSON, by key and requested type.
+    /// Without this, a Lua binding reading one setting per fixed tick pays a full
+    /// System.Text.Json converter dispatch 40 times a second for a constant.
+    /// </summary>
+    private readonly Dictionary<string, (Type Type, object? Value)> _typed = new(StringComparer.Ordinal);
+
     private readonly Lock _gate = new();
+    private readonly Timer _flushTimer;
+    private int _dirty;
 
     public ModConfig(string configDirectory, string modName)
     {
         Directory.CreateDirectory(configDirectory);
         _path = Path.Combine(configDirectory, modName + ".json");
         _values = Load(_path);
+
+        _flushTimer = new Timer(_ => Flush(), null, Timeout.Infinite, Timeout.Infinite);
+
+        // Best effort only: a game that is force-quit never gets here, which is
+        // why the delay above is short and the write itself is atomic.
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => Flush();
     }
 
     private static Dictionary<string, JsonElement> Load(string path)
@@ -46,28 +69,45 @@ internal sealed class ModConfig : IModConfig
     {
         lock (_gate)
         {
+            if (_typed.TryGetValue(key, out (Type Type, object? Value) cached) && cached.Type == typeof(T))
+                return (T)cached.Value!;
+
             if (!_values.TryGetValue(key, out JsonElement element))
                 return fallback;
 
+            T result;
             try
             {
-                return element.Deserialize<T>(Options) ?? fallback;
+                result = element.Deserialize<T>(Options) ?? fallback;
             }
-            catch
+            catch (Exception ex)
             {
-                return fallback;
+                // A setting that silently reverts to its default every launch is
+                // very hard to diagnose. Caching the fallback both answers the
+                // next call cheaply and keeps this from logging on every read.
+                Logging.Error($"{_path}: '{key}' is not a valid {typeof(T).Name}; using the default", ex);
+                result = fallback;
             }
+
+            _typed[key] = (typeof(T), result);
+            return result;
         }
     }
 
     public void Set<T>(string key, T value)
     {
         lock (_gate)
+        {
             _values[key] = JsonSerializer.SerializeToElement(value, Options);
+            _typed[key] = (typeof(T), value);
+        }
     }
 
     public void Save()
     {
+        // Whatever prompted this, the pending flush has nothing left to do.
+        Interlocked.Exchange(ref _dirty, 0);
+
         lock (_gate)
         {
             string temp = _path + ".tmp";
@@ -85,5 +125,30 @@ internal sealed class ModConfig : IModConfig
                 try { File.Delete(temp); } catch { /* best effort */ }
             }
         }
+    }
+
+    public void SaveDeferred()
+    {
+        // Already scheduled: the pending flush will pick this change up too, so
+        // a run of stepper clicks costs one write rather than one each.
+        if (Interlocked.Exchange(ref _dirty, 1) == 1)
+            return;
+
+        try
+        {
+            _flushTimer.Change(FlushDelayMs, Timeout.Infinite);
+        }
+        catch (ObjectDisposedException)
+        {
+            Save();
+        }
+    }
+
+    private void Flush()
+    {
+        if (Interlocked.Exchange(ref _dirty, 0) == 0)
+            return;
+
+        Save();
     }
 }

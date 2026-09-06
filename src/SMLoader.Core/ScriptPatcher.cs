@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Text;
 using SMLoader.Api;
 
 namespace SMLoader.Core;
@@ -10,14 +12,42 @@ internal static class ScriptPatcher
 {
     private readonly record struct Registration(string ModName, string PathContains, Action<ScriptLoadContext> Patch);
 
-    private static readonly List<Registration> Registrations = new();
-    private static readonly HashSet<string> SeenScripts = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// Registrations are append-only, so they are published as a whole array and
+    /// read without a lock. This is on the path of every chunk the engine
+    /// compiles, most of which no mod cares about.
+    /// </summary>
+    private static Registration[] _registrations = Array.Empty<Registration>();
+
+    /// <summary>
+    /// Patched output keyed by chunk name and a hash of the incoming bytes. A
+    /// world load compiles the same scripts for each of its ~10 states, and
+    /// rebuilding meant a full UTF-8 decode, every mod's transform and a re-encode
+    /// each time, on the world-load critical path.
+    /// </summary>
+    private static readonly ConcurrentDictionary<(string Name, ulong Hash), byte[]?> Cache = new();
+
+    /// <summary>Chunk names no mod matched, logged once each so mod authors can find them.</summary>
+    private static readonly ConcurrentDictionary<string, byte> UnmatchedSeen = new(StringComparer.OrdinalIgnoreCase);
+
+    private const int MaxCacheEntries = 512;
+    private const int MaxUnmatchedLogged = 256;
+
     private static readonly Lock Gate = new();
 
     public static void Register(string modName, string pathContains, Action<ScriptLoadContext> patch)
     {
         lock (Gate)
-            Registrations.Add(new Registration(modName, pathContains, patch));
+        {
+            Registration[] updated = new Registration[_registrations.Length + 1];
+            Array.Copy(_registrations, updated, _registrations.Length);
+            updated[^1] = new Registration(modName, pathContains, patch);
+
+            Volatile.Write(ref _registrations, updated);
+
+            // Anything already built predates this registration.
+            Cache.Clear();
+        }
 
         Logging.Write($"[{modName}] will patch scripts matching '{pathContains}'");
     }
@@ -26,49 +56,69 @@ internal static class ScriptPatcher
     /// source is only decoded once a name actually matches.</summary>
     public static bool WantsScript(string name)
     {
-        lock (Gate)
-        {
-            if (SeenScripts.Add(name))
-                Logging.Write($"script: {name}");
+        Registration[] registrations = Volatile.Read(ref _registrations);
 
-            foreach (Registration registration in Registrations)
-            {
-                if (name.Contains(registration.PathContains, StringComparison.OrdinalIgnoreCase))
-                    return true;
-            }
+        // One field read when nobody has registered anything - the same early-out
+        // AssetPatcher.Resolve uses, and for the same reason.
+        if (registrations.Length == 0)
+            return false;
+
+        foreach (Registration registration in registrations)
+        {
+            if (name.Contains(registration.PathContains, StringComparison.OrdinalIgnoreCase))
+                return true;
         }
+
+        NoteUnmatched(name);
         return false;
     }
 
-    /// <summary>Returns the rewritten source, or null if nothing changed.</summary>
-    public static string? Apply(string name, string source)
+    /// <summary>
+    /// Returns the rewritten chunk as UTF-8, or null to leave the engine
+    /// compiling its own bytes.
+    /// </summary>
+    public static byte[]? Apply(string name, ReadOnlySpan<byte> source)
     {
-        Registration[] matching;
-        lock (Gate)
-        {
-            matching = Registrations
-                .Where(r => name.Contains(r.PathContains, StringComparison.OrdinalIgnoreCase))
-                .ToArray();
-        }
-
-        if (matching.Length == 0)
+        Registration[] registrations = Volatile.Read(ref _registrations);
+        if (registrations.Length == 0)
             return null;
 
-        var context = new ScriptLoadContext(name, source);
-        bool changed = false;
+        var key = (name, Hash(source));
+        if (Cache.TryGetValue(key, out byte[]? cached))
+            return cached;
 
-        foreach (Registration registration in matching)
+        byte[]? built = Build(name, source, registrations);
+
+        if (Cache.Count >= MaxCacheEntries)
+            Cache.Clear();
+
+        Cache[key] = built;
+        return built;
+    }
+
+    private static byte[]? Build(string name, ReadOnlySpan<byte> source, Registration[] registrations)
+    {
+        var context = new ScriptLoadContext(name, Encoding.UTF8.GetString(source));
+
+        foreach (Registration registration in registrations)
         {
+            if (!name.Contains(registration.PathContains, StringComparison.OrdinalIgnoreCase))
+                continue;
+
             try
             {
-                string before = context.Source;
+                int revision = context.Revision;
+                int before = context.Length;
+
                 registration.Patch(context);
 
-                if (!ReferenceEquals(before, context.Source) && before != context.Source)
+                // Comparing revisions rather than the text itself: reading Source
+                // to compare would flatten the builder between every mod's turn,
+                // which is the concatenation cost this was meant to remove.
+                if (context.Revision != revision)
                 {
-                    changed = true;
                     Logging.Write($"[{registration.ModName}] patched {name} " +
-                                  $"({before.Length} -> {context.Source.Length} chars)");
+                                  $"({before} -> {context.Length} chars)");
                 }
             }
             catch (Exception ex)
@@ -78,6 +128,46 @@ internal static class ScriptPatcher
             }
         }
 
-        return changed ? context.Source : null;
+        if (context.Revision == 0)
+            return null;
+
+        byte[] patched = Encoding.UTF8.GetBytes(context.Source);
+
+        // A mod that rewrote the chunk back to what it already was gets the same
+        // "compile your own bytes" answer as one that did nothing.
+        return patched.AsSpan().SequenceEqual(source) ? null : patched;
+    }
+
+    /// <summary>
+    /// FNV-1a. Not a security hash - it identifies one build of one script, and
+    /// the chunk name is part of the key. Chosen over System.IO.Hashing to avoid
+    /// putting another assembly next to the loader for this.
+    /// </summary>
+    private static ulong Hash(ReadOnlySpan<byte> data)
+    {
+        const ulong offsetBasis = 14695981039346656037;
+        const ulong prime = 1099511628211;
+
+        ulong hash = offsetBasis;
+        foreach (byte b in data)
+        {
+            hash ^= b;
+            hash *= prime;
+        }
+
+        // Length too, so a truncated read cannot collide with the whole file.
+        return hash ^ (ulong)data.Length;
+    }
+
+    private static void NoteUnmatched(string name)
+    {
+        // Bounded: this used to be an unbounded HashSet fed by every chunk the
+        // engine ever compiled. Past the cap the names stop being recorded, which
+        // costs nothing but the log line.
+        if (UnmatchedSeen.Count >= MaxUnmatchedLogged)
+            return;
+
+        if (UnmatchedSeen.TryAdd(name, 0))
+            Logging.Write($"script: {name}");
     }
 }
