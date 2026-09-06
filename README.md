@@ -72,7 +72,18 @@ environment so `steam_api64` initialises without a `steam_appid.txt` inside the
 game folder.
 
 Diagnostics land in `dist\smloader.log` - the shim and the managed side both
-write there, tagged `[shim]` and `[core]`.
+write there, tagged `[shim]` and `[core]`. Set `SMLOADER_LOG_LEVEL` to
+`Trace`, `Debug`, `Warn` or `Error` to move the threshold; it defaults to
+`Info`, and `Trace` adds a line per distinct script the engine compiles.
+
+Tests:
+
+```powershell
+dotnet test SMLoader.slnx -c Release
+```
+
+If something misbehaves, `--no-mods` boots the loader with no mods at all,
+which separates a loader problem from a mod problem in one launch.
 
 ## Startup splash
 

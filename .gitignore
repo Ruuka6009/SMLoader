@@ -22,3 +22,5 @@ replay_pid*.log
 *.dmp
 core.*
 smloader.log
+tests/*/bin/
+tests/*/obj/

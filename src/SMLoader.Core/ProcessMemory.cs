@@ -241,7 +241,12 @@ internal sealed class ProcessMemory : IMemory
         return 0;
     }
 
-    private static (byte[] Bytes, bool[] Wildcard) ParsePattern(string pattern)
+    /// <summary>
+    /// Internal rather than private so it can be tested directly. It is pure,
+    /// and every interesting case - "??", a bare "?", invalid hex, an empty
+    /// pattern - is a silent wrong answer at a scan site rather than an error.
+    /// </summary>
+    internal static (byte[] Bytes, bool[] Wildcard) ParsePattern(string pattern)
     {
         string[] tokens = pattern.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var bytes = new byte[tokens.Length];

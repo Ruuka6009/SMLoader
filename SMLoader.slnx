@@ -4,6 +4,9 @@
     <Project Path="src/SMLoader.Core/SMLoader.Core.csproj" />
     <Project Path="src/SMLoader.Launcher/SMLoader.Launcher.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SMLoader.Tests/SMLoader.Tests.csproj" />
+  </Folder>
   <Folder Name="/mods/">
     <Project Path="mods/NoclipMod/NoclipMod.csproj" />
   </Folder>

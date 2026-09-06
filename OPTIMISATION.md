@@ -1747,7 +1747,7 @@ Mod authors currently need the whole repository to build against `IMod`. Publish
 There is no test project. A surprising amount of this codebase is pure and
 directly testable — including the parts most likely to break silently.
 
-### 10.1 [Q] Unit-testable today, with no refactoring
+### 10.1 [Q] ~~Unit-testable today, with no refactoring~~ — RESOLVED, four of six
 
 | Target | What to assert |
 |---|---|
@@ -1757,6 +1757,33 @@ directly testable — including the parts most likely to break silently.
 | `ProcessMemory.ParsePattern` | `??`, `?`, odd tokens, invalid hex, empty, all-wildcard |
 | `GameLocator.PathEntry` regex | real `libraryfolders.vdf` samples, escaped backslashes, UNC paths |
 | `ScriptPatcher` matching | case-insensitive `Contains` semantics, multiple registrations |
+
+**`tests/SMLoader.Tests` exists and holds 53 passing tests** over
+`ScriptLoadContext`, `KeyNames.Describe`, `Banner.Build` and
+`ProcessMemory.ParsePattern`, covering every boundary listed above for those
+four.
+
+MSTest rather than xUnit, for the dull reason that MSTest was already in the
+local NuGet cache and a test project that cannot restore offline is a test
+project nobody runs.
+
+The only production change it needed was `ParsePattern` going from `private` to
+`internal`, plus an `InternalsVisibleTo`. Everything else was reachable as
+written, which is the point §10.1 was making.
+
+Two targets are **not** done, both deliberately:
+
+- **`ScriptPatcher` matching.** Its registrations are process-wide static state,
+  so tests would leak into each other in whatever order the runner picked. It
+  needs the seam from §10.2 first, or a reset hook — and a reset hook that
+  exists only for tests is worth doing consciously, not by accident.
+- **`GameLocator.PathEntry`.** It lives in `SMLoader.Launcher`, which the test
+  project does not reference. Worth adding with real `libraryfolders.vdf`
+  samples, as this item says.
+
+The tests found no bugs. That is worth stating plainly rather than implying
+otherwise: they are a regression net for the next change, not a discovery of
+existing faults.
 
 ### 10.2 [Q] Testable after a small seam
 
@@ -1943,7 +1970,6 @@ Next up is the performance block, starting at §2.1.
     §3.7 fell out of §2.8
 
 The performance block is done apart from §2.2, which was tried and reverted.
-Next is hardening and tooling, starting at item 20.
 
 ### Then — hardening and tooling
 
@@ -1955,9 +1981,13 @@ Next is hardening and tooling, starting at item 20.
     minus `/WX` and `/Qspectre`; see the item for why
 23. ~~§9.5 Turn analysers on and warnings into errors~~ — done, and §9.3 / §6.7
     fell out of it
-24. §10 A test project, starting with the pure functions
+24. ~~§10 A test project, starting with the pure functions~~ — done: 53 tests
+    over four of the six §10.1 targets. `ScriptPatcher` needs the §10.2 seam
+    first and `GameLocator` needs a reference to the launcher
 25. ~~§11.1 Log levels~~ — done. §11.2, the single buffered writer, is still
     open, and so are §11.3 rotation and §11.4 counters
+
+Hardening and tooling is done except §11.2, the single buffered writer.
 
 ### Longer term — design
 
