@@ -1212,7 +1212,23 @@ works.
 
 Applied, with a ten-second retry interval doing both jobs: a failed read is
 retried rather than cached, and a successful one is refreshed so rebinding a key
-mid-session is picked up. `Load` returns a bool and leaves the existing bindings
+mid-session is picked up.
+
+**The first version of this shipped broken, and the failure is worth keeping.**
+The timestamp was seeded with `long.MinValue` to force a first read.
+`now - long.MinValue` overflows to a large negative number — signed overflow is
+unchecked in C# — so `elapsed >= interval` was false forever and the file was
+*never* read. Every binding fell back to QWERTY.
+
+On an AZERTY keyboard that broke ZQSD movement while leaving Space and Ctrl
+working, because those two fallbacks are the same on both layouts. It therefore
+presented as "noclip movement is broken" rather than "keybinds did not load",
+and the absence of the `read N keybinds` line in the log was the thing that
+identified it.
+
+Fixed with a separate `_attempted` flag rather than a sentinel timestamp, and
+`RetryIntervalTests` pins the arithmetic — including the overflow itself, as an
+executable statement of why the flag exists. `Load` returns a bool and leaves the existing bindings
 alone on failure — a transient failure must not replace good bindings with none —
 and the error is logged once rather than every ten seconds.
 

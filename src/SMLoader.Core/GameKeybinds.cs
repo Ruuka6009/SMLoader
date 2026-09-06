@@ -25,7 +25,17 @@ internal static class GameKeybinds
     /// cached for the whole session. Doubles as the re-read interval, so
     /// rebinding a key mid-session is picked up without a restart.
     /// </summary>
-    private static long _lastAttempt = long.MinValue;
+    private static long _lastAttempt;
+
+    /// <summary>
+    /// Separate from the timestamp on purpose. Seeding _lastAttempt with
+    /// long.MinValue to force a first read did the opposite: now - long.MinValue
+    /// overflows to a large negative number, so the interval test was false
+    /// forever and the file was never read at all. Every binding fell back to
+    /// QWERTY, which on an AZERTY keyboard broke ZQSD movement while leaving
+    /// Space and Ctrl working, because those fallbacks are layout-independent.
+    /// </summary>
+    private static bool _attempted;
 
     private const long RetryMs = 10_000;
 
@@ -34,8 +44,9 @@ internal static class GameKeybinds
         lock (Gate)
         {
             long now = Environment.TickCount64;
-            if (now - _lastAttempt >= RetryMs)
+            if (!_attempted || now - _lastAttempt >= RetryMs)
             {
+                _attempted = true;
                 _lastAttempt = now;
 
                 // Only announce the first success. After that this is a re-read
