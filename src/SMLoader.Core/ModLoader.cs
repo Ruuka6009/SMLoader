@@ -17,6 +17,9 @@ internal sealed class ModLoader
     /// <summary>File name -> expected SHA-256, or null when no allowlist is in force.</summary>
     private Dictionary<string, string>? _allowed;
 
+    /// <summary>Names already taken, so a duplicate is caught rather than shadowing.</summary>
+    private readonly HashSet<string> _names = new(StringComparer.OrdinalIgnoreCase);
+
     public ModLoader(string root) => _root = root;
 
     public IReadOnlyList<IMod> Loaded => _loaded;
@@ -40,7 +43,17 @@ internal sealed class ModLoader
 
         LoadAllowList(modsDirectory);
 
-        foreach (string modDirectory in Directory.EnumerateDirectories(modsDirectory))
+        // Sorted, because EnumerateDirectories returns filesystem order, which is
+        // neither stable nor meaningful. Two mods appending to the same script and
+        // both wrapping client_onUpdate - which SettingsPanel and NoclipMod do
+        // today - would otherwise nest in whichever order the volume happened to
+        // hand back. Ordinal by directory name is arbitrary but at least the same
+        // on every machine and every launch, until mod.json declares it properly
+        // (OPTIMISATION.md 8.2).
+        List<string> directories = Directory.EnumerateDirectories(modsDirectory).ToList();
+        directories.Sort(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string modDirectory in directories)
             LoadFrom(modDirectory);
 
         Logging.Write($"{_loaded.Count} mod(s) loaded");
@@ -152,6 +165,10 @@ internal sealed class ModLoader
             // Loaded from memory rather than by path: a running game would
             // otherwise hold the file open and block the next mod rebuild.
             Assembly assembly = LoadWithoutLocking(context, assemblyPath);
+
+            if (!IsApiCompatible(assembly, name))
+                return;
+
             types = GetLoadableTypes(assembly, name);
         }
         catch (Exception ex)
@@ -172,6 +189,17 @@ internal sealed class ModLoader
             try
             {
                 var mod = (IMod)Activator.CreateInstance(type)!;
+
+                // Config files, settings keys and log prefixes are all keyed on
+                // the name, so two mods sharing one would quietly overwrite each
+                // other's settings.
+                if (!_names.Add(mod.Name))
+                {
+                    Logging.Error($"a mod named '{mod.Name}' is already loaded; " +
+                                  $"skipping the one in {Path.GetFileName(assemblyPath)}");
+                    continue;
+                }
+
                 var host = new ModHost(_root, mod.Name);
 
                 mod.OnLoad(host);
@@ -183,6 +211,32 @@ internal sealed class ModLoader
                 Logging.Error($"failed to load '{type.FullName}' from mod '{name}'", ex);
             }
         }
+    }
+
+    /// <summary>
+    /// Checks the API version the mod was built against before anything in it
+    /// is constructed. The alternative is a MissingMethodException at an
+    /// arbitrary later moment, usually inside a Lua callback where the
+    /// trampoline catches it and the player just sees a feature not working.
+    /// </summary>
+    private static bool IsApiCompatible(Assembly assembly, string name)
+    {
+        var stamp = assembly.GetCustomAttribute<SMLoaderApiVersionAttribute>();
+        if (stamp is null)
+        {
+            // Built before the handshake existed, or outside this repository.
+            // Loading it is no worse than the loader has always been, so this
+            // warns rather than refuses - see OPTIMISATION.md 9.12.
+            Logging.Warn($"{name} carries no API version; loading it anyway, but it " +
+                         $"cannot be checked against SMLoader API {ApiVersion.Text}");
+            return true;
+        }
+
+        if (ApiVersion.IsCompatible(stamp.Version, out string reason))
+            return true;
+
+        Logging.Error($"{name} {reason}; not loading it");
+        return false;
     }
 
     /// <summary>

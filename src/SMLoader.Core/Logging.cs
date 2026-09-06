@@ -19,6 +19,27 @@ internal static class Logging
     private static string _path = "smloader.log";
 
     /// <summary>
+    /// Held open rather than reopened per line. A world load compiles a lot of
+    /// scripts, and an open/close pair per line lands on the thread doing the
+    /// compiling.
+    /// </summary>
+    /// <remarks>
+    /// Sharing the file with the shim is safe because both sides append: the
+    /// stream is opened <see cref="FileMode.Append"/> with
+    /// <see cref="FileShare.ReadWrite"/>, which maps to FILE_APPEND_DATA, and an
+    /// append through such a handle is atomic against other appenders. Each line
+    /// is written in one call and flushed, so two writers cannot interleave
+    /// halfway through one.
+    /// <para>
+    /// Deliberately still synchronous. Draining through a background queue would
+    /// take logging off the game thread, but it would also mean the last lines
+    /// before a crash are the ones sitting in the queue - and those are the lines
+    /// the log exists for. Revisit alongside a real shutdown path (§5.9).
+    /// </para>
+    /// </remarks>
+    private static FileStream? _stream;
+
+    /// <summary>
     /// Lines below this are dropped. Set with <c>SMLOADER_LOG_LEVEL</c>
     /// (Trace/Debug/Info/Warn/Error), defaulting to Info.
     /// </summary>
@@ -37,7 +58,16 @@ internal static class Logging
     }
 
     public static void Initialize(string rootDirectory)
-        => _path = Path.Combine(rootDirectory, "smloader.log");
+    {
+        lock (Gate)
+        {
+            _path = Path.Combine(rootDirectory, "smloader.log");
+
+            // The path changed, so whatever was open pointed at the fallback.
+            _stream?.Dispose();
+            _stream = null;
+        }
+    }
 
     public static void Write(string message) => Write(LogLevel.Info, message);
 
@@ -59,18 +89,25 @@ internal static class Logging
         {
             try
             {
-                // FileShare.ReadWrite because the native shim appends to this
-                // same file. Anything less and one side loses its lines during
-                // boot, when both are chatty and a failure most needs both.
-                using var stream = new FileStream(_path, FileMode.Append, FileAccess.Write,
-                                                  FileShare.ReadWrite);
+                // bufferSize 1 disables the stream's own buffering, so one line is
+                // one write and there is nothing left sitting in a buffer when the
+                // process dies.
+                _stream ??= new FileStream(_path, FileMode.Append, FileAccess.Write,
+                                           FileShare.ReadWrite, bufferSize: 1);
+
                 byte[] bytes = Encoding.UTF8.GetBytes(line);
-                stream.Write(bytes, 0, bytes.Length);
+                _stream.Write(bytes, 0, bytes.Length);
+                _stream.Flush();
             }
             catch
             {
-                // Logging must never take the game down. The debugger channel
-                // is the fallback because it cannot fail.
+                // Logging must never take the game down. Drop the handle so the
+                // next line tries again rather than the log going quiet for the
+                // rest of the session, and use the debugger channel meanwhile
+                // because it cannot fail.
+                try { _stream?.Dispose(); } catch { /* nothing left to try */ }
+                _stream = null;
+
                 OutputDebugStringW(line);
             }
         }

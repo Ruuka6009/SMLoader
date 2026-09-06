@@ -1397,11 +1397,15 @@ slots.
 That is the right choice, but a truncated line gives no indication it was
 truncated. Append `…` when `_vsnprintf_s` returns `-1`.
 
-### 7.6 [P] `log::Write` opens and closes the file per line
+### 7.6 [P] ~~`log::Write` opens and closes the file per line~~ — RESOLVED
 
 `log.cpp:55-62`. Keep a single handle open for the process lifetime — opened with
 `FILE_SHARE_READ | FILE_SHARE_WRITE`, written with `FILE_APPEND_DATA`, which is
 atomic across processes — and flush on a timer. See §11.2.
+
+Applied, with one retry: something outside the process can invalidate the
+handle, and going quiet for the rest of the session over it would be worse than
+reopening.
 
 ### 7.7 [Q] ~~Build flags are not hardened~~ — RESOLVED, minus two flags
 
@@ -1449,7 +1453,7 @@ first thing security software flags.
 
 ## 8. API design and mod compatibility
 
-### 8.1 [C] There is no API version handshake
+### 8.1 [C] ~~There is no API version handshake~~ — RESOLVED
 
 `IMod.Version` describes the *mod*. Nothing checks that the mod was built against
 a compatible `SMLoader.Api`. A mod compiled against an older API that has since
@@ -1469,7 +1473,28 @@ Emitted automatically by a props file mods import; checked by `ModLoader` before
 `Activator.CreateInstance`, with a clear "NoclipMod targets SMLoader API 1.0,
 this loader provides 2.0" message.
 
-### 8.2 [Q] No mod metadata, dependencies, or load order
+**Applied, and the version is 2.0 — because 0.1.0's implicit 1.0 has already
+been broken twice by this very review:** `IMemory.Unprotect` became
+`TryUnprotect` with a bool return (§1.6), and `LuaState` became a readonly struct
+(§2.1). Had this item existed first, both would have been a refusal with a
+sentence instead of a `MissingMethodException` inside a Lua callback.
+
+The attribute takes a **string** `"major.minor"` rather than the sketch's two
+integers, because MSBuild's `<AssemblyAttribute>` passes literals as strings and
+typing them back to `int` is fragile across SDK versions. The parse and the
+compatibility rules live in `ApiVersion`, and are the best-covered thing in the
+test project.
+
+Rules: a different major is refused, a higher minor is refused, a lower minor
+loads, since minors are additive. A mod carrying **no** stamp is warned about and
+loaded — that is no worse than the loader has always been, and until
+`SMLoader.Api` ships as a package with build assets (§9.12) an out-of-repo mod
+has no way to carry one.
+
+`mods/Directory.Build.props` stamps every mod in this repository. It hard-codes
+the version, so a test asserts the two agree.
+
+### 8.2 [Q] No mod metadata, dependencies, or load order — PARTLY RESOLVED
 
 Mods are discovered by directory scan and loaded in
 `Directory.EnumerateDirectories` order — filesystem order, which is neither
@@ -1493,7 +1518,18 @@ Add a `mod.json` per mod:
 and topologically sort before loading. Give `PatchScript` an explicit
 `int priority` too, so append order is declared rather than emergent.
 
-### 8.3 [Q] Duplicate mod names are not detected
+**The non-determinism is fixed; the metadata is not.** `LoadAll` sorts the
+directories ordinally before loading, so the nesting order of two mods wrapping
+`client_onUpdate` is at least the same on every machine and every launch.
+Ordinal-by-name is arbitrary, but arbitrary-and-stable is a different class of
+problem from filesystem order — it is what makes a bug report reproducible.
+
+`mod.json`, dependencies, topological sort and `PatchScript(priority)` are still
+open. They are a design piece rather than a fix, and `priority` is another
+breaking API change — worth batching with whatever else goes into API 3.0 rather
+than spending a major version on it alone.
+
+### 8.3 [Q] ~~Duplicate mod names are not detected~~ — RESOLVED
 
 `ModLoader` will happily load two mods called `NoclipMod`; they then share a
 config file (`Config/NoclipMod.json`) and collide in `SettingsRegistry`. Reject
@@ -1873,7 +1909,7 @@ always had and existing log-reading habits still work. `script: {name}` dropped
 to `Trace` and `lua_State 0x... available` to `Debug` — which is the third bullet
 of §2.8 finally landing.
 
-### 11.2 [P] One writer, buffered, off the game thread
+### 11.2 [P] One writer, buffered, off the game thread — HALF DONE, DELIBERATELY
 
 Both logging implementations open, write and close the file per line (§1.2,
 §7.6, §2.15). Under a script-heavy world load that is hundreds of open/close
@@ -1891,6 +1927,30 @@ using LogCallback = void(__cdecl*)(int level, const char* utf8);
 Managed side enqueues into a bounded `Channel<string>` drained by a dedicated
 low-priority thread. Bounded, with `DropOldest` — logging must never block the
 game and must never grow without limit.
+
+**The open/close cost is gone. The off-thread queue is not, and should not be
+until there is a shutdown path.**
+
+Both sides now hold their append handle open for the process lifetime — the shim
+in `log.cpp`, the managed side as a `FileStream` opened `bufferSize: 1` so one
+line is one write with nothing left sitting in a buffer. `FILE_APPEND_DATA`
+makes an append atomic against other appenders, so the two writers cannot
+interleave halfway through a line — which is what made keeping both safe, rather
+than needing the `BootContext` callback this item sketches.
+
+The queue is the part left undone. Draining through a background thread takes
+logging off the game thread, but it also means **the last lines before a crash
+are the ones still sitting in the queue** — and those are the lines the log
+exists for. A loader whose log reliably omits the moment of failure is worse than
+one that costs a write on the game thread.
+
+Two things have already removed most of the pressure this item was written
+against: §11.1 dropped `script: {name}` to `Trace`, so the chatty per-compile
+line is off by default, and the handles above removed the open/close pair. What
+remains is one buffered write per surviving line.
+
+Revisit with §5.9. A shutdown path gives the queue somewhere to flush; without
+one, the queue is a way to lose the evidence.
 
 ### 11.3 [Q] No log rotation
 
@@ -1987,11 +2047,14 @@ The performance block is done apart from §2.2, which was tried and reverted.
 25. ~~§11.1 Log levels~~ — done. §11.2, the single buffered writer, is still
     open, and so are §11.3 rotation and §11.4 counters
 
-Hardening and tooling is done except §11.2, the single buffered writer.
+Hardening and tooling is done, except the off-thread half of §11.2, which is
+deliberately left until there is a shutdown path to flush it.
 
 ### Longer term — design
 
-26. §8.1 / §8.2 API version handshake, mod manifests, deterministic load order
+26. §8.1 / §8.2 API version handshake, mod manifests, deterministic load order —
+    ~~handshake~~ and ~~deterministic order~~ done, and §8.3 with them.
+    Manifests, dependencies and `PatchScript(priority)` are still open
 27. §8.4 Collectible load contexts and disposable registrations → hot reload
 28. §11.4 Instrumentation, so the next version of this document has numbers in it
 

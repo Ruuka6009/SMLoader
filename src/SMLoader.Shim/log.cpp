@@ -9,6 +9,22 @@
 namespace {
 std::wstring g_logPath;
 std::mutex   g_mutex;
+
+// Held open for the life of the process rather than reopened per line. Under a
+// script-heavy world load that was hundreds of open/close pairs on the thread
+// compiling scripts.
+//
+// FILE_APPEND_DATA is what makes sharing this file with the managed side safe:
+// an append through such a handle is atomic against other appenders, so two
+// writers cannot interleave halfway through a line.
+HANDLE       g_handle = INVALID_HANDLE_VALUE;
+
+HANDLE OpenAppendHandle()
+{
+    return CreateFileW(g_logPath.c_str(), FILE_APPEND_DATA,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
 }
 
 namespace smloader::log {
@@ -30,6 +46,8 @@ void Init()
                            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h != INVALID_HANDLE_VALUE)
         CloseHandle(h);
+
+    g_handle = OpenAppendHandle();
 }
 
 void Write(const char* fmt, ...)
@@ -56,15 +74,20 @@ void Write(const char* fmt, ...)
     if (g_logPath.empty())
         return;
 
-    HANDLE h = CreateFileW(g_logPath.c_str(), FILE_APPEND_DATA,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
+    // One retry: something outside the process can invalidate the handle, and
+    // losing the log for the rest of the session over it would be worse than
+    // the reopen.
+    if (g_handle == INVALID_HANDLE_VALUE)
+        g_handle = OpenAppendHandle();
+    if (g_handle == INVALID_HANDLE_VALUE)
         return;
 
     DWORD written = 0;
-    WriteFile(h, line, static_cast<DWORD>(n), &written, nullptr);
-    CloseHandle(h);
+    if (!WriteFile(g_handle, line, static_cast<DWORD>(n), &written, nullptr))
+    {
+        CloseHandle(g_handle);
+        g_handle = INVALID_HANDLE_VALUE;
+    }
 }
 
 } // namespace smloader::log

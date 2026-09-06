@@ -1,0 +1,23 @@
+<Project>
+
+  <!-- Chain to the repository-wide props; MSBuild stops at the first match. -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+  <ItemGroup>
+    <!--
+      Stamps the API version every mod in this repository was built against, so
+      the loader can refuse a mod compiled against an API that has since changed
+      shape rather than letting it fail with MissingMethodException inside a Lua
+      callback, where the trampoline swallows it.
+
+      Keep this in step with SMLoader.Api's ApiVersion.Major/Minor. Mods built
+      outside this repository get it once SMLoader.Api ships as a package with
+      build assets (OPTIMISATION.md 9.12); until then a missing stamp is a
+      warning rather than a refusal.
+    -->
+    <AssemblyAttribute Include="SMLoader.Api.SMLoaderApiVersionAttribute">
+      <_Parameter1>2.0</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+</Project>
