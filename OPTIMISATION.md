@@ -1563,7 +1563,7 @@ than spending a major version on it alone.
 config file (`Config/NoclipMod.json`) and collide in `SettingsRegistry`. Reject
 duplicates with a clear error.
 
-### 8.4 [Q] Mods cannot be unloaded or reloaded
+### 8.4 [Q] Mods cannot be unloaded or reloaded — GROUNDWORK DONE
 
 `ModLoadContext` is `isCollectible: false` (`ModLoader.cs:106`). The
 load-from-memory trick already avoids file locking, so making the context
@@ -1576,6 +1576,48 @@ every registration a disposable handle.
 ```csharp
 IDisposable PatchScript(string pathContains, Action<ScriptLoadContext> patch);
 ```
+
+**The designing-for part is done. The context is still `isCollectible: false`,
+deliberately.**
+
+`PatchScript`, `PatchAsset` and `AddLuaFunction` all return a handle now, and
+each registry can genuinely remove an entry rather than only append one:
+
+- `ScriptPatcher` rebuilds its published array without the entry and clears the
+  output cache, since every cached result was built with that transform in it.
+- `AssetPatcher` removes the registration, clears the resolution cache, **and
+  republishes the shim's path filter** — otherwise the native prefilter keeps
+  waking managed code for a transform that no longer exists.
+- `LuaApi` removes the function and bumps the generation. It cannot free the
+  tables already built for live states, because releasing a registry reference is
+  only legal on the Lua thread; `Seed` does it on the next pass, which is the
+  same rule §1.3 established.
+- `SettingsRegistry` gains `RemoveAll(modName)` rather than a per-registration
+  handle, because `Declare` returns the setting's *value* and changing that would
+  change what declaring a setting means.
+
+Every handle is idempotent, because disposing twice must not remove an entry
+somebody else has since registered.
+
+`ModHost` tracks every handle it hands out, so `ModHost.Unregister()` withdraws a
+mod completely **without the mod having kept its handles** — which matters,
+because no mod in this repository keeps them. That is the whole teardown path,
+written and reviewable, with nothing calling it yet.
+
+**What is left is the part that cannot be reasoned about from here:** flipping
+`isCollectible: true`, calling `AssemblyLoadContext.Unload`, and proving no
+reference survives to keep the old assembly alive — a single delegate still held
+by a live `lua_State`'s registry, or by the game's own script table, silently
+turns a hot reload into a leak that looks like it worked. That needs a running
+game, a world load either side, and a way to observe whether the context
+actually collected.
+
+This is bumped to API **3.0**; see [§8.1](#81-c-there-is-no-api-version-handshake).
+Returning `IDisposable` instead of `void` is source-compatible — a caller
+ignoring the result still compiles — but the signatures changed, so a mod built
+against 2.0 will not bind. The handshake catches that with a sentence, which is
+the first time this document's own churn has been caught by something it asked
+for.
 
 ### 8.5 [Q] `IMemory` has no way to express "this pointer is still valid"
 
@@ -2117,7 +2159,10 @@ deliberately left until there is a shutdown path to flush it.
 26. §8.1 / §8.2 API version handshake, mod manifests, deterministic load order —
     ~~handshake~~ and ~~deterministic order~~ done, and §8.3 with them.
     Manifests, dependencies and `PatchScript(priority)` are still open
-27. §8.4 Collectible load contexts and disposable registrations → hot reload
+27. §8.4 Collectible load contexts and disposable registrations → hot reload —
+    ~~disposable registrations~~ done, along with a complete per-mod teardown
+    path. The collectible context and the unload itself are left: they need a
+    running game to prove nothing keeps the old assembly alive
 28. ~~§11.4 Instrumentation, so the next version of this document has numbers in
     it~~ — done, and §11.5 / §5.9 / §7.4 with it. The numbers themselves are the
     next step: the counters exist, a session's worth of them does not

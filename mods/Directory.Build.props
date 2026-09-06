@@ -16,7 +16,7 @@
       warning rather than a refusal.
     -->
     <AssemblyAttribute Include="SMLoader.Api.SMLoaderApiVersionAttribute">
-      <_Parameter1>2.0</_Parameter1>
+      <_Parameter1>3.0</_Parameter1>
     </AssemblyAttribute>
   </ItemGroup>
 

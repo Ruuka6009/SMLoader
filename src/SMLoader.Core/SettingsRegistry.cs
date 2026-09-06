@@ -30,6 +30,24 @@ internal static class SettingsRegistry
         }
     }
 
+    /// <summary>
+    /// Drops every entry belonging to one mod. Unlike the other registries this
+    /// is per mod rather than per registration: a setting is identified by mod
+    /// and key, and <c>Declare</c> already returns the value rather than a
+    /// handle, so there is nothing to hand back without changing what
+    /// declaring a setting means.
+    /// </summary>
+    public static void RemoveAll(string modName)
+    {
+        int removed;
+        lock (Gate)
+            removed = Entries.RemoveAll(e => string.Equals(e.ModName, modName,
+                                                          StringComparison.OrdinalIgnoreCase));
+
+        if (removed > 0)
+            Logging.Write($"[{modName}] withdrew {removed} setting(s)");
+    }
+
     public static IReadOnlyList<ModSettingEntry> All
     {
         get

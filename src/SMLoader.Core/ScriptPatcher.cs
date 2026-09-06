@@ -36,13 +36,16 @@ internal static class ScriptPatcher
 
     private static readonly Lock Gate = new();
 
-    public static void Register(string modName, string pathContains, Action<ScriptLoadContext> patch)
+    public static IDisposable Register(string modName, string pathContains,
+                                       Action<ScriptLoadContext> patch)
     {
+        var registration = new Registration(modName, pathContains, patch);
+
         lock (Gate)
         {
             Registration[] updated = new Registration[_registrations.Length + 1];
             Array.Copy(_registrations, updated, _registrations.Length);
-            updated[^1] = new Registration(modName, pathContains, patch);
+            updated[^1] = registration;
 
             Volatile.Write(ref _registrations, updated);
 
@@ -51,6 +54,47 @@ internal static class ScriptPatcher
         }
 
         Logging.Write($"[{modName}] will patch scripts matching '{pathContains}'");
+        return new Handle(registration);
+    }
+
+    private static void Unregister(Registration registration)
+    {
+        lock (Gate)
+        {
+            Registration[] current = _registrations;
+            int index = Array.IndexOf(current, registration);
+            if (index < 0)
+                return;
+
+            Registration[] updated = new Registration[current.Length - 1];
+            Array.Copy(current, 0, updated, 0, index);
+            Array.Copy(current, index + 1, updated, index, current.Length - index - 1);
+
+            Volatile.Write(ref _registrations, updated);
+
+            // Every cached result was built with this registration in it.
+            Cache.Clear();
+        }
+
+        Logging.Write($"[{registration.ModName}] no longer patches scripts matching " +
+                      $"'{registration.PathContains}'");
+    }
+
+    /// <summary>Idempotent: disposing twice must not remove someone else's entry.</summary>
+    private sealed class Handle : IDisposable
+    {
+        private Registration? _registration;
+
+        public Handle(Registration registration) => _registration = registration;
+
+        public void Dispose()
+        {
+            Registration? registration = _registration;
+            _registration = null;
+
+            if (registration is not null)
+                Unregister(registration.Value);
+        }
     }
 
     /// <summary>True when any mod wants to see this chunk. Kept cheap: the

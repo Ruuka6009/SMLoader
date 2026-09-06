@@ -24,11 +24,13 @@ internal static class LuaApi
     private static int _seededEnvironments;
     private static int _generation;
 
-    public static void Add(string modName, string name, LuaFunction function)
+    public static IDisposable Add(string modName, string name, LuaFunction function)
     {
+        var entry = (name, function);
+
         lock (Gate)
         {
-            Functions.Add((name, function));
+            Functions.Add(entry);
 
             // Tables already built are now short a function. Bump the generation
             // rather than dropping the entries: releasing a registry slot is only
@@ -39,6 +41,48 @@ internal static class LuaApi
         }
 
         Logging.Write($"[{modName}] exposed {TableName}.{name}()");
+        return new Handle(modName, entry);
+    }
+
+    /// <summary>
+    /// Removes a function. The generation bump is what matters: the tables
+    /// already built for live states still contain it, and they are rebuilt on
+    /// the Lua thread the next time Seed runs - which is the only thread allowed
+    /// to release the old one.
+    /// </summary>
+    private static void Remove(string modName, (string Name, LuaFunction Function) entry)
+    {
+        lock (Gate)
+        {
+            if (!Functions.Remove(entry))
+                return;
+
+            _generation++;
+        }
+
+        Logging.Write($"[{modName}] withdrew {TableName}.{entry.Name}()");
+    }
+
+    /// <summary>Idempotent: disposing twice must not withdraw someone else's function.</summary>
+    private sealed class Handle : IDisposable
+    {
+        private readonly string _modName;
+        private (string Name, LuaFunction Function)? _entry;
+
+        public Handle(string modName, (string Name, LuaFunction Function) entry)
+        {
+            _modName = modName;
+            _entry = entry;
+        }
+
+        public void Dispose()
+        {
+            (string Name, LuaFunction Function)? entry = _entry;
+            _entry = null;
+
+            if (entry is not null)
+                Remove(_modName, entry.Value);
+        }
     }
 
     /// <summary>

@@ -29,7 +29,12 @@ public interface IModHost
     /// nothing on disk is modified, so Steam's file verification has nothing to
     /// undo and uninstalling the mod fully reverts the change.
     /// </remarks>
-    void PatchScript(string pathContains, Action<ScriptLoadContext> patch);
+    /// <returns>
+    /// A handle that removes the registration when disposed. A mod that never
+    /// unloads can ignore it; it exists so a mod <em>can</em> be unloaded, which
+    /// nothing appending to a static list forever could ever support.
+    /// </returns>
+    IDisposable PatchScript(string pathContains, Action<ScriptLoadContext> patch);
 
     /// <summary>
     /// Publishes a function as <c>smloader.&lt;name&gt;</c> inside every game
@@ -41,7 +46,8 @@ public interface IModHost
     /// seeds the table into each environment as it is installed - this is the
     /// supported way for injected Lua to call back into a mod.
     /// </remarks>
-    void AddLuaFunction(string name, LuaFunction function);
+    /// <returns>A handle that removes the function when disposed.</returns>
+    IDisposable AddLuaFunction(string name, LuaFunction function);
 
     /// <summary>
     /// Rewrites a game data file (a GUI layout, for instance) as it is opened.
@@ -51,7 +57,8 @@ public interface IModHost
     /// Like <see cref="PatchScript"/>, nothing on disk is modified - the result
     /// is cached inside the loader and the engine is redirected to it.
     /// </remarks>
-    void PatchAsset(string pathContains, Func<string, string> transform);
+    /// <returns>A handle that removes the transform when disposed.</returns>
+    IDisposable PatchAsset(string pathContains, Func<string, string> transform);
 
     /// <summary>This mod's persisted settings.</summary>
     IModConfig Config { get; }

@@ -30,15 +30,19 @@ public sealed class SMLoaderApiVersionAttribute : Attribute
 /// - typically inside a Lua callback, where the trampoline catches it and the
 /// player sees a feature quietly not working.
 /// <para>
-/// <b>2.0</b> because 0.1.0's implicit 1.0 has already been broken twice:
-/// <c>IMemory.Unprotect</c> became <c>TryUnprotect</c> with a bool return, and
-/// <c>LuaState</c> became a readonly struct.
+/// <b>3.0</b>. 0.1.0's implicit 1.0 was broken by <c>IMemory.Unprotect</c>
+/// becoming <c>TryUnprotect</c> with a bool return and <c>LuaState</c> becoming
+/// a readonly struct (2.0), and again by <c>PatchScript</c>, <c>PatchAsset</c>
+/// and <c>AddLuaFunction</c> returning <see cref="IDisposable"/> instead of
+/// void (3.0). That last one is source-compatible - a caller ignoring the
+/// result still compiles - but the signatures changed, so an already-built mod
+/// would not bind.
 /// </para>
 /// </remarks>
 public static class ApiVersion
 {
     /// <summary>Incompatible when it differs: members have been removed or changed shape.</summary>
-    public const int Major = 2;
+    public const int Major = 3;
 
     /// <summary>Additive. A mod targeting a lower minor is fine; a higher one is not.</summary>
     public const int Minor = 0;

@@ -90,7 +90,7 @@ public class ApiVersionTests
         var stamp = typeof(SMLoaderApiVersionAttribute);
         Assert.IsNotNull(stamp, "the attribute must stay public for mods to carry it");
 
-        Assert.IsTrue(ApiVersion.IsCompatible("2.0", out _),
-                      "mods/Directory.Build.props stamps 2.0; update both together");
+        Assert.IsTrue(ApiVersion.IsCompatible("3.0", out _),
+                      "mods/Directory.Build.props stamps 3.0; update both together");
     }
 }

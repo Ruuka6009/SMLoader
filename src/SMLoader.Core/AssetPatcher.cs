@@ -43,16 +43,55 @@ internal static class AssetPatcher
         Directory.CreateDirectory(_cacheDirectory);
     }
 
-    public static void Register(string modName, string pathContains, Func<string, string> transform)
+    public static IDisposable Register(string modName, string pathContains,
+                                      Func<string, string> transform)
     {
+        var registration = new Registration(modName, pathContains, transform);
+
         lock (Gate)
         {
-            Registrations.Add(new Registration(modName, pathContains, transform));
+            Registrations.Add(registration);
             Resolved.Clear(); // a new rule may match paths already judged a miss
         }
 
         PublishPathFilter();
         Logging.Write($"[{modName}] will patch assets matching '{pathContains}'");
+        return new Handle(registration);
+    }
+
+    private static void Unregister(Registration registration)
+    {
+        lock (Gate)
+        {
+            if (!Registrations.Remove(registration))
+                return;
+
+            // Cached hits were produced by a transform that no longer applies.
+            Resolved.Clear();
+        }
+
+        // The shim's prefilter is built from the registrations, so it has to be
+        // narrowed too or it keeps waking managed code for nothing.
+        PublishPathFilter();
+        Logging.Write($"[{registration.ModName}] no longer patches assets matching " +
+                      $"'{registration.PathContains}'");
+    }
+
+    /// <summary>Idempotent: disposing twice must not remove someone else's entry.</summary>
+    private sealed class Handle : IDisposable
+    {
+        private Registration? _registration;
+
+        public Handle(Registration registration) => _registration = registration;
+
+        public void Dispose()
+        {
+            Registration? registration = _registration;
+            _registration = null;
+
+            if (registration is not null)
+                Unregister(registration.Value);
+        }
     }
 
     /// <summary>
