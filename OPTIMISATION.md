@@ -66,7 +66,7 @@ terminator hands `CreateFileW` stack garbage. It is now `{}`-initialised.
 as rendered text can be defeated by a control character in that source. Where an
 item turns on an exact byte, check the bytes.
 
-### 1.2 [C] Log writes race between the shim and the managed side, and both lose
+### 1.2 [C] ~~Log writes race between the shim and the managed side, and both lose~~ — RESOLVED
 
 `src/SMLoader.Shim/log.cpp:55` opens with `FILE_SHARE_READ` only.
 `src/SMLoader.Core/Logging.cs:26` uses `File.AppendAllText`, which opens with
@@ -166,7 +166,7 @@ region is also readable.
 Applied exactly, guarded on the next region actually being readable — the
 overlap must not turn a bounded scan into a fault.
 
-### 1.6 [C] `Unprotect` ignores failure, and `Protect` can leave a page RWX
+### 1.6 [C] ~~`Unprotect` ignores failure, and `Protect` can leave a page RWX~~ — RESOLVED
 
 `src/SMLoader.Core/ProcessMemory.cs:128-135`
 
@@ -972,7 +972,7 @@ it, or drop it once logging is levelled (§2.8, §11.1).
 
 ## 4. Concurrency and the native/managed boundary
 
-### 4.1 [C] Detour globals are plain, non-atomic pointers
+### 4.1 [C] ~~Detour globals are plain, non-atomic pointers~~ — RESOLVED
 
 `src/SMLoader.Shim/iat_hook.cpp:14-30`
 
@@ -983,6 +983,18 @@ with no synchronisation. On x64 a naturally aligned pointer load/store will not
 tear, but the compiler is free to reorder or cache the read across the detour
 body. `std::atomic<T>` with acquire/release costs nothing at runtime on x64 and
 makes both the intent and the guarantee explicit.
+
+Applied to every slot and every original-function pointer. The detours load with
+`memory_order_acquire`; installation stores the original with
+`memory_order_release` **before** `WriteSlot` makes the detour reachable, so a
+call arriving the instant after the write always has something to forward to.
+`UnhookAll` takes each slot with an exchange, so a concurrent `RetirePcallHook`
+or a second `UnhookAll` cannot restore one twice.
+
+The `Reapply` window the item describes — a call going through the real function
+between reading it and redirecting the slot — is **not** closed by this, and
+cannot be without suspending threads. It is benign: the call reaches the real
+`luaL_newstate` and the state is simply not announced.
 
 The `Reapply` sequence is the sharp case:
 
@@ -1027,7 +1039,7 @@ Two threads logging concurrently can both pass the check and both call
 `AllocConsole`. Use `Interlocked.Exchange(ref _ready, 1) != 0`, or
 `LazyInitializer.EnsureInitialized`.
 
-### 4.4 [C] `LuaApi.Seed` holds a lock across calls into the Lua VM
+### 4.4 [C] ~~`LuaApi.Seed` holds a lock across calls into the Lua VM~~ — RESOLVED
 
 `src/SMLoader.Core/LuaApi.cs:62-81`
 
@@ -1038,7 +1050,13 @@ commands on world load" pattern), that is a self-deadlock across a non-reentrant
 boundary. Build the function list into an immutable snapshot outside the lock and
 take the lock only for the dictionary write.
 
-### 4.5 [E] `_resolvingAsset` guards recursion but not the same file from another thread
+Applied exactly. `GetOrCreateTable` now takes `Gate` twice — once to snapshot the
+functions and generation, once to store the resulting reference — and every call
+into the Lua VM happens between them with no lock held. The `luaL_unref` of a
+superseded table moved out too; it is still only reachable from the thread that
+owns the state, which is what makes it legal.
+
+### 4.5 [E] ~~`_resolvingAsset` guards recursion but not the same file from another thread~~ — RESOLVED
 
 `src/SMLoader.Core/Entry.cs:240-241` — `[ThreadStatic]`, which is right for the
 recursion it was written for. But `AssetPatcher.Build` calls `Logging.Write`,
@@ -1047,6 +1065,16 @@ thread inside `Logging.Write` for the same file is unguarded and passes through
 `AssetPatcher.Resolve`. It cannot recurse infinitely, but the log path gets
 cached as a miss and pays the managed round trip. Add the loader's own directory
 to a native-side exclusion list (§2.10).
+
+**Resolved by §2.10 rather than by an exclusion list.** The prefilter is built
+from the substrings mods actually registered, so `smloader.log` only crosses into
+managed code if some mod registers a transform matching it. With no asset
+registrations at all — the current state — the detour never calls managed code
+for any path, log included.
+
+An explicit exclusion would be worth adding the day a mod registers something
+broad enough to match the loader's own directory. Until then it would be a rule
+guarding against nothing.
 
 ### 4.6 [Q] `volatile long` + `Interlocked` is not the modern idiom
 
@@ -1101,7 +1129,7 @@ install is `Interlocked`-guarded, since a second `Boot` would otherwise subscrib
 twice. `IsTerminating` is logged, because in the terminating case that line is the
 only record there will be.
 
-### 5.2 [E] `Boot`'s own catch can throw
+### 5.2 [E] ~~`Boot`'s own catch can throw~~ — RESOLVED
 
 `src/SMLoader.Core/Entry.cs:98-102` — the handler calls `Logging.Error`, but if
 the failure *was* `Logging.Initialize`, `_path` is a bare relative filename and
@@ -1248,13 +1276,19 @@ leaving the original slot untouched and the stack balanced. The mutation is now
 documented on `ToStringValue` itself, including *why* it matters: a `lua_next`
 traversal breaks when a key changes type underneath it.
 
-### 5.12 [E] The `smloader` table can be `nil` in injected Lua and nothing checks
+### 5.12 [E] ~~The `smloader` table can be `nil` in injected Lua and nothing checks~~ — RESOLVED
 
 `src/SMLoader.Core/SettingsPanel.cs:111` calls `smloader.settingAt(i)` after only
 checking that `smloader.settingCount` exists. If seeding failed — no
 `lua_setfenv` slot, a case the shim already logs at `iat_hook.cpp:269` — the
 panel throws inside a `pcall` and silently does nothing. Guard each call, and
 surface "SMLoader could not reach this script's environment" in the log once.
+
+Applied. The panel checks `settingAt` as well as `settingCount` before calling
+either, reports once through `smloader.logMessage` — falling back to `print` when
+even that is missing, which is the case where the table never arrived at all —
+and defaults the row fields, so one malformed entry cannot take the panel down
+with it.
 
 ---
 

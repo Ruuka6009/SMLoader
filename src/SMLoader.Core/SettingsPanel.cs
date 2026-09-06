@@ -98,9 +98,23 @@ internal static class SettingsPanel
                   FontName = "SM_HeaderLarge_Medium", TextAlign = "Center",
                   x = 30, y = 22, width = SMLOADER_PANEL_W - 60, height = 40 }
 
+            -- Every smloader entry is checked, not just settingCount. If seeding
+            -- failed - no lua_setfenv slot, which the shim logs - the table is nil
+            -- or partial, and calling through it throws inside the engine pcall
+            -- where the panel just silently does nothing.
+            local ok = smloader and smloader.settingCount and smloader.settingAt
+
             local count = 0
-            if smloader and smloader.settingCount then
+            if ok then
                 count = smloader.settingCount()
+            elseif not SMLOADER_REPORTED_MISSING then
+                SMLOADER_REPORTED_MISSING = true
+                if smloader and smloader.logMessage then
+                    smloader.logMessage( "the smloader table is missing from this script; "
+                        .. "the settings panel cannot list anything" )
+                else
+                    print( "[SMLoader] the smloader table never reached the settings panel" )
+                end
             end
             if count > SMLOADER_MAX_ROWS then
                 count = SMLOADER_MAX_ROWS
@@ -109,6 +123,8 @@ internal static class SettingsPanel
             local y = 80
             for i = 1, count do
                 local modName, key, label, kind, value = smloader.settingAt( i )
+                modName = modName or "?"
+                label = label or key or "?"
                 local caption = value
                 if self.cl.smloaderAwaitKey == i then
                     caption = "PRESS A KEY..."

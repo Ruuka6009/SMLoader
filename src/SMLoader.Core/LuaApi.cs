@@ -165,41 +165,57 @@ internal static class LuaApi
 
     private static int GetOrCreateTable(nint L)
     {
+        // Snapshot under the lock, then release it. Everything below calls into
+        // the Lua VM, and holding Gate across that would self-deadlock the moment
+        // a mod called AddLuaFunction from inside a Lua callback - a "register my
+        // commands on world load" pattern is entirely plausible, and Gate is not
+        // reentrant across that boundary.
+        (string Name, LuaFunction Function)[] functions;
+        int generation;
+        bool hadEntry;
+        TableEntry previous;
+
         lock (Gate)
         {
-            if (TableRefs.TryGetValue(L, out TableEntry entry))
-            {
-                if (entry.Generation == _generation)
-                    return entry.Reference;
+            hadEntry = TableRefs.TryGetValue(L, out previous);
+            if (hadEntry && previous.Generation == _generation)
+                return previous.Reference;
 
-                // We are on the Lua thread here, so this is the one place the old
-                // table's slot can be given back rather than leaked.
-                luaL_unref(L, LUA_REGISTRYINDEX, entry.Reference);
+            if (hadEntry)
                 TableRefs.Remove(L);
-            }
 
-            var lua = new LuaState(L);
-            lua.NewTable();
-
-            foreach ((string name, LuaFunction function) in Functions)
-                lua.SetFunction(name, function);
-
-            // luaL_ref pops the table and hands back a registry slot, so the
-            // table survives without living in any script's environment.
-            int reference = luaL_ref(L, LUA_REGISTRYINDEX);
-
-            // LUA_REFNIL (-1) means the value on top was nil, LUA_NOREF (-2) that
-            // the reference could not be made. Both mean the table is not there,
-            // and treating either as a slot number reads an unrelated one.
-            if (reference <= 0)
-            {
-                Logging.Error($"luaL_ref returned {reference} on lua_State 0x{L:x}; " +
-                              $"'{TableName}' will be missing from this state");
-                return 0;
-            }
-
-            TableRefs[L] = new TableEntry(reference, _generation);
-            return reference;
+            functions = Functions.ToArray();
+            generation = _generation;
         }
+
+        // Only ever reached on the thread that owns this state, which is what
+        // makes releasing the old slot here legal.
+        if (hadEntry)
+            luaL_unref(L, LUA_REGISTRYINDEX, previous.Reference);
+
+        var lua = new LuaState(L);
+        lua.NewTable();
+
+        foreach ((string name, LuaFunction function) in functions)
+            lua.SetFunction(name, function);
+
+        // luaL_ref pops the table and hands back a registry slot, so the table
+        // survives without living in any script's environment.
+        int reference = luaL_ref(L, LUA_REGISTRYINDEX);
+
+        // LUA_REFNIL (-1) means the value on top was nil, LUA_NOREF (-2) that the
+        // reference could not be made. Both mean the table is not there, and
+        // treating either as a slot number reads an unrelated one.
+        if (reference <= 0)
+        {
+            Logging.Error($"luaL_ref returned {reference} on lua_State 0x{L:x}; " +
+                          $"'{TableName}' will be missing from this state");
+            return 0;
+        }
+
+        lock (Gate)
+            TableRefs[L] = new TableEntry(reference, generation);
+
+        return reference;
     }
 }

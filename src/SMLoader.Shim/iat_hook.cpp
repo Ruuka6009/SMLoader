@@ -15,36 +15,43 @@ namespace {
 using luaL_newstate_t = void* (__cdecl*)();
 using lua_pcall_t     = int (__cdecl*)(void*, int, int, int);
 
-void**          g_slot = nullptr;   // the IAT entry we patched
-luaL_newstate_t g_original = nullptr;
+// Every original-function pointer below is written by the boot thread, in
+// InstallLuaHooks / Reapply / HookFileApis, and read by the game's threads
+// inside the detours. On x64 an aligned pointer load will not tear, but the
+// compiler is free to reorder or cache the read across the detour body.
+// Acquire/release costs nothing here at runtime and makes the guarantee
+// explicit rather than incidental.
+std::atomic<void**>          g_slot{nullptr};   // the IAT entry we patched
+std::atomic<luaL_newstate_t> g_original{nullptr};
 
 // Atomic: Detour_lua_pcall can retire the hook from more than one thread at
 // once, and the exchange is what makes exactly one of them do it.
 std::atomic<void**> g_pcallSlot{nullptr};
-lua_pcall_t     g_originalPcall = nullptr;
+std::atomic<lua_pcall_t>     g_originalPcall{nullptr};
 
 using CreateFileW_t = HANDLE (__stdcall*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
-void**          g_createFileSlot = nullptr;
-CreateFileW_t   g_originalCreateFileW = nullptr;
+std::atomic<void**>        g_createFileSlot{nullptr};
+std::atomic<CreateFileW_t> g_originalCreateFileW{nullptr};
 
 using lua_setfenv_t = int (__cdecl*)(void*, int);
-void**          g_setfenvSlot = nullptr;
-lua_setfenv_t   g_originalSetfenv = nullptr;
+std::atomic<void**>        g_setfenvSlot{nullptr};
+std::atomic<lua_setfenv_t> g_originalSetfenv{nullptr};
 
 using luaL_loadbufferx_t = int (__cdecl*)(void*, const char*, size_t, const char*, const char*);
-void**             g_loadSlot = nullptr;
-luaL_loadbufferx_t g_originalLoad = nullptr;
+std::atomic<void**>             g_loadSlot{nullptr};
+std::atomic<luaL_loadbufferx_t> g_originalLoad{nullptr};
 
 using lua_close_t = void (__cdecl*)(void*);
-void**        g_closeSlot = nullptr;
-lua_close_t   g_originalClose = nullptr;
+std::atomic<void**>      g_closeSlot{nullptr};
+std::atomic<lua_close_t> g_originalClose{nullptr};
 
 volatile long g_lateHooked = 0;
 void*         g_notificationCookie = nullptr;
 
 void* __cdecl Detour_luaL_newstate()
 {
-    void* L = g_original ? g_original() : nullptr;
+    const luaL_newstate_t original = g_original.load(std::memory_order_acquire);
+    void* L = original ? original() : nullptr;
     SMLOG("luaL_newstate -> lua_State* %p", L);
     if (L)
         smloader::OnLuaStateCreated(L);
@@ -53,7 +60,7 @@ void* __cdecl Detour_luaL_newstate()
 
 int __cdecl Detour_lua_pcall(void* L, int nargs, int nresults, int errfunc)
 {
-    const int result = g_originalPcall(L, nargs, nresults, errfunc);
+    const int result = g_originalPcall.load(std::memory_order_acquire)(L, nargs, nresults, errfunc);
 
     // Ask the managed side whether the VM is populated yet. It answers true
     // once it has emitted its splash, after which we unhook.
@@ -72,9 +79,10 @@ int __cdecl Detour_luaL_loadbufferx(void* L, const char* buff, size_t sz,
     const bool transformed =
         smloader::TransformScript(name, buff, sz, &replacement, &replacementLength);
 
+    const luaL_loadbufferx_t original = g_originalLoad.load(std::memory_order_acquire);
     const int result = transformed
-        ? g_originalLoad(L, replacement, replacementLength, name, mode)
-        : g_originalLoad(L, buff, sz, name, mode);
+        ? original(L, replacement, replacementLength, name, mode)
+        : original(L, buff, sz, name, mode);
 
     if (transformed)
         smloader::ReleaseScriptSource(replacement);
@@ -91,8 +99,8 @@ void __cdecl Detour_lua_close(void* L)
     if (L)
         smloader::OnLuaStateClosing(L);
 
-    if (g_originalClose)
-        g_originalClose(L);
+    if (const lua_close_t original = g_originalClose.load(std::memory_order_acquire))
+        original(L);
 }
 
 int __cdecl Detour_lua_setfenv(void* L, int idx)
@@ -103,7 +111,7 @@ int __cdecl Detour_lua_setfenv(void* L, int idx)
     // arrive. The callback is required to leave the stack balanced, which
     // keeps a relative idx valid for the original call.
     smloader::SeedScriptEnvironment(L);
-    return g_originalSetfenv(L, idx);
+    return g_originalSetfenv.load(std::memory_order_acquire)(L, idx);
 }
 
 HANDLE __stdcall Detour_CreateFileW(LPCWSTR fileName, DWORD access, DWORD share,
@@ -130,8 +138,8 @@ HANDLE __stdcall Detour_CreateFileW(LPCWSTR fileName, DWORD access, DWORD share,
             fileName = replacement;
     }
 
-    return g_originalCreateFileW(fileName, access, share, security,
-                                 disposition, flags, templateFile);
+    return g_originalCreateFileW.load(std::memory_order_acquire)(
+        fileName, access, share, security, disposition, flags, templateFile);
 }
 
 bool WriteSlot(void** slot, void* value)
@@ -246,8 +254,9 @@ bool HookCreateFileInQuiet(HMODULE module, void*** hookedSlot)
     if (current == reinterpret_cast<void*>(&Detour_CreateFileW))
         return false; // already ours
 
-    if (!g_originalCreateFileW)
-        g_originalCreateFileW = reinterpret_cast<CreateFileW_t>(current);
+    CreateFileW_t expected = nullptr;
+    g_originalCreateFileW.compare_exchange_strong(
+        expected, reinterpret_cast<CreateFileW_t>(current), std::memory_order_acq_rel);
 
     if (!WriteSlot(slot, reinterpret_cast<void*>(&Detour_CreateFileW)))
         return false;
@@ -409,23 +418,26 @@ namespace smloader::iat {
 bool InstallLuaHooks()
 {
     HMODULE exe = GetModuleHandleW(nullptr);
-    g_slot = FindIatSlot(exe, "lua51.dll", "luaL_newstate");
-    if (!g_slot)
+    void** newstateSlot = FindIatSlot(exe, "lua51.dll", "luaL_newstate");
+    if (!newstateSlot)
     {
         SMLOG("FAILED: no IAT slot for lua51.dll!luaL_newstate in the main module");
         return false;
     }
 
-    g_original = reinterpret_cast<luaL_newstate_t>(*g_slot);
-    if (!WriteSlot(g_slot, reinterpret_cast<void*>(&Detour_luaL_newstate)))
+    // The original is published before the slot, so a detour that starts
+    // running the instant the slot is written always sees it.
+    g_original.store(reinterpret_cast<luaL_newstate_t>(*newstateSlot), std::memory_order_release);
+    if (!WriteSlot(newstateSlot, reinterpret_cast<void*>(&Detour_luaL_newstate)))
     {
-        SMLOG("FAILED: VirtualProtect on IAT slot %p", static_cast<void*>(g_slot));
-        g_slot = nullptr;
+        SMLOG("FAILED: VirtualProtect on IAT slot %p", static_cast<void*>(newstateSlot));
         return false;
     }
+    g_slot.store(newstateSlot, std::memory_order_release);
 
     SMLOG("hooked luaL_newstate (slot %p, original %p)",
-          static_cast<void*>(g_slot), reinterpret_cast<void*>(g_original));
+          static_cast<void*>(newstateSlot),
+          reinterpret_cast<void*>(g_original.load(std::memory_order_relaxed)));
 
     g_pcallSlot = FindIatSlot(exe, "lua51.dll", "lua_pcall");
     if (g_pcallSlot)
@@ -490,16 +502,21 @@ bool InstallLuaHooks()
 
 void Reapply()
 {
-    if (!g_slot)
+    void** slot = g_slot.load(std::memory_order_acquire);
+    if (!slot)
         return;
-    if (*g_slot == reinterpret_cast<void*>(&Detour_luaL_newstate))
+    if (*slot == reinterpret_cast<void*>(&Detour_luaL_newstate))
         return;
 
-    // The loader resolved imports after we patched; re-take the slot.
-    g_original = reinterpret_cast<luaL_newstate_t>(*g_slot);
-    if (WriteSlot(g_slot, reinterpret_cast<void*>(&Detour_luaL_newstate)))
+    // The loader resolved imports after we patched; re-take the slot. The
+    // original is published before the slot is redirected, so a call arriving
+    // the instant after the write always finds something to forward to.
+    const luaL_newstate_t original = reinterpret_cast<luaL_newstate_t>(*slot);
+    g_original.store(original, std::memory_order_release);
+
+    if (WriteSlot(slot, reinterpret_cast<void*>(&Detour_luaL_newstate)))
         SMLOG("re-applied luaL_newstate hook (original now %p)",
-              reinterpret_cast<void*>(g_original));
+              reinterpret_cast<void*>(original));
 }
 
 void HookFileApis()
@@ -540,7 +557,10 @@ void UnhookAll()
 
     // CreateFileW is hooked in many modules and we did not record which, so
     // walk them again and restore any slot still pointing at our detour.
-    if (g_originalCreateFileW)
+    const CreateFileW_t originalCreateFileW =
+        g_originalCreateFileW.load(std::memory_order_acquire);
+
+    if (originalCreateFileW)
     {
         const HANDLE self = GetCurrentProcess();
         DWORD needed = 0;
@@ -563,29 +583,31 @@ void UnhookAll()
                                            "CreateFileW");
 
                     if (slot && *slot == reinterpret_cast<void*>(&Detour_CreateFileW))
-                        WriteSlot(slot, reinterpret_cast<void*>(g_originalCreateFileW));
+                        WriteSlot(slot, reinterpret_cast<void*>(originalCreateFileW));
                 }
             }
         }
     }
 
-    // The Lua slots are each a single known location.
-    if (g_slot && *g_slot == reinterpret_cast<void*>(&Detour_luaL_newstate))
-        WriteSlot(g_slot, reinterpret_cast<void*>(g_original));
-    if (g_pcallSlot && *g_pcallSlot == reinterpret_cast<void*>(&Detour_lua_pcall))
-        WriteSlot(g_pcallSlot, reinterpret_cast<void*>(g_originalPcall));
-    if (g_setfenvSlot && *g_setfenvSlot == reinterpret_cast<void*>(&Detour_lua_setfenv))
-        WriteSlot(g_setfenvSlot, reinterpret_cast<void*>(g_originalSetfenv));
-    if (g_loadSlot && *g_loadSlot == reinterpret_cast<void*>(&Detour_luaL_loadbufferx))
-        WriteSlot(g_loadSlot, reinterpret_cast<void*>(g_originalLoad));
-    if (g_closeSlot && *g_closeSlot == reinterpret_cast<void*>(&Detour_lua_close))
-        WriteSlot(g_closeSlot, reinterpret_cast<void*>(g_originalClose));
+    // The Lua slots are each a single known location. Taken with an exchange
+    // so a concurrent RetirePcallHook or a second UnhookAll cannot restore the
+    // same slot twice.
+    auto restore = [](std::atomic<void**>& slotHolder, void* detour, void* original) {
+        void** slot = slotHolder.exchange(nullptr, std::memory_order_acq_rel);
+        if (slot && *slot == detour)
+            WriteSlot(slot, original);
+    };
 
-    g_slot = nullptr;
-    g_pcallSlot = nullptr;
-    g_setfenvSlot = nullptr;
-    g_loadSlot = nullptr;
-    g_closeSlot = nullptr;
+    restore(g_slot, reinterpret_cast<void*>(&Detour_luaL_newstate),
+            reinterpret_cast<void*>(g_original.load(std::memory_order_acquire)));
+    restore(g_pcallSlot, reinterpret_cast<void*>(&Detour_lua_pcall),
+            reinterpret_cast<void*>(g_originalPcall.load(std::memory_order_acquire)));
+    restore(g_setfenvSlot, reinterpret_cast<void*>(&Detour_lua_setfenv),
+            reinterpret_cast<void*>(g_originalSetfenv.load(std::memory_order_acquire)));
+    restore(g_loadSlot, reinterpret_cast<void*>(&Detour_luaL_loadbufferx),
+            reinterpret_cast<void*>(g_originalLoad.load(std::memory_order_acquire)));
+    restore(g_closeSlot, reinterpret_cast<void*>(&Detour_lua_close),
+            reinterpret_cast<void*>(g_originalClose.load(std::memory_order_acquire)));
 }
 
 void RetirePcallHook()
@@ -596,7 +618,7 @@ void RetirePcallHook()
     if (!slot)
         return;
 
-    WriteSlot(slot, reinterpret_cast<void*>(g_originalPcall));
+    WriteSlot(slot, reinterpret_cast<void*>(g_originalPcall.load(std::memory_order_acquire)));
     SMLOG("lua_pcall hook retired");
 }
 
