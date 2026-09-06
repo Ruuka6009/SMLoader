@@ -29,7 +29,7 @@ internal sealed class ModSettings : IModSettings
 
         // Materialise the default on first run so the config file is
         // discoverable and the panel always has something to show.
-        T current = _config.Get(setting.Key, (T)Convert.ChangeType(setting.Default, typeof(T)));
+        T current = _config.Get(setting.Key, ConvertDefault<T>(setting));
         _config.Set(setting.Key, current);
 
         // Deferred, so declaring N settings at startup is one file write
@@ -44,6 +44,31 @@ internal sealed class ModSettings : IModSettings
 
         Logging.Write($"[{_modName}] setting '{setting.Key}' = {current}");
         return current;
+    }
+
+    /// <summary>
+    /// A mod's declared default, as T. Convert.ChangeType on a mismatch throws
+    /// straight out of OnLoad, so Declare&lt;int&gt; with a default of "F2"
+    /// stopped the whole mod loading - a mod authoring mistake presenting as a
+    /// loader failure. Reported and defaulted instead.
+    /// </summary>
+    private T ConvertDefault<T>(ModSetting setting)
+    {
+        if (setting.Default is T already)
+            return already;
+
+        try
+        {
+            return (T)Convert.ChangeType(setting.Default, typeof(T));
+        }
+        catch (Exception ex) when (ex is InvalidCastException or FormatException
+                                      or OverflowException or ArgumentException)
+        {
+            Logging.Error($"[{_modName}] setting '{setting.Key}': default " +
+                          $"'{setting.Default}' is not a {typeof(T).Name}; using " +
+                          $"default({typeof(T).Name})", ex);
+            return default!;
+        }
     }
 
     private object ReadBoxed(ModSetting setting) => setting.Kind switch

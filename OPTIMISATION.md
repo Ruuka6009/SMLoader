@@ -150,7 +150,7 @@ is nil and `LUA_NOREF` (`-2`) on failure. The code only rejected `0`.
 Now rejected at `<= 0` and logged with the state address, in both
 `GetOrCreateTable` and its callers.
 
-### 1.5 [C] Pattern matches that straddle a memory-region boundary are never found
+### 1.5 [C] ~~Pattern matches that straddle a memory-region boundary are never found~~ — RESOLVED
 
 `src/SMLoader.Core/ProcessMemory.cs:170-195`
 
@@ -162,6 +162,9 @@ awkward boundary is unlikely but not impossible, and the failure mode reads as
 
 Scan with an overlap of `pattern.Length - 1` into the next region when that
 region is also readable.
+
+Applied exactly, guarded on the next region actually being readable — the
+overlap must not turn a bounded scan into a fault.
 
 ### 1.6 [C] `Unprotect` ignores failure, and `Protect` can leave a page RWX
 
@@ -270,7 +273,7 @@ Walking the headers of arbitrary just-loaded modules made
 and [§7.2](#72-e-no-image_nt_optional_hdr64_magic-check) prerequisites rather
 than nice-to-haves, so both are done too.
 
-### 1.9 [C] `GENERIC_WRITE` is not the only way to open a file for writing
+### 1.9 [C] ~~`GENERIC_WRITE` is not the only way to open a file for writing~~ — RESOLVED
 
 `src/SMLoader.Shim/iat_hook.cpp:89`
 
@@ -292,6 +295,10 @@ if (fileName && (access & kWriteBits) == 0 && disposition == OPEN_EXISTING)
 
 Gating on `OPEN_EXISTING` as well means a create or truncate can never be
 redirected.
+
+Applied verbatim. This is the sharpest item in the document: the comment above
+that line already said a mistake there could never corrupt a game file, and the
+check underneath it did not deliver that.
 
 ### 1.10 [C] ~~`ConcurrentDictionary.GetOrAdd` does not guarantee the factory runs once~~ — RESOLVED
 
@@ -986,7 +993,7 @@ function without notifying us — a lost `lua_State`. Release-store at (1) befor
 (2), and stop reapplying as soon as the slot has been stable (§2.20) to shrink
 the window to nothing.
 
-### 4.2 [C] `RetirePcallHook` clears the slot pointer before restoring it
+### 4.2 [C] ~~`RetirePcallHook` clears the slot pointer before restoring it~~ — RESOLVED
 
 `src/SMLoader.Shim/iat_hook.cpp:312-321`
 
@@ -1001,7 +1008,10 @@ Two threads entering `Detour_lua_pcall` simultaneously can both read a non-null
 written twice) but the pattern is fragile. Use
 `std::atomic_exchange(&g_pcallSlot, nullptr)` and act only on a non-null result.
 
-### 4.3 [C] `GameConsole._ready` is a racy, non-volatile guard
+Applied. `g_pcallSlot` is an `std::atomic<void**>` and the exchange decides which
+thread owns the restore.
+
+### 4.3 [C] ~~`GameConsole._ready` is a racy, non-volatile guard~~ — RESOLVED
 
 `src/SMLoader.Core/GameConsole.cs:13-19`
 
@@ -1100,7 +1110,7 @@ while doing nothing at all. On failure, **unhook everything** and log one clear
 line. A player whose .NET install is broken should get a game that runs exactly
 as fast as an unmodded one.
 
-### 5.4 [E] `Declare<T>`'s `Convert.ChangeType` can throw and kill a mod load
+### 5.4 [E] ~~`Declare<T>`'s `Convert.ChangeType` can throw and kill a mod load~~ — RESOLVED
 
 `src/SMLoader.Core/ModSettings.cs:32`
 
@@ -1147,7 +1157,7 @@ leave `.tmp` files accumulating beside the configs.
 that quietly reverts to its default every launch is very hard to diagnose. Log
 once per key.
 
-### 5.7 [E] Keybinds are loaded once and a failure is permanent
+### 5.7 [E] ~~Keybinds are loaded once and a failure is permanent~~ — RESOLVED
 
 `src/SMLoader.Core/GameKeybinds.cs:24-28`
 
@@ -1159,6 +1169,12 @@ if (!_loaded) { _loaded = true; Load(); }
 file at that instant — is cached for the session. Distinguish "loaded" from
 "attempted", and re-check the file's mtime periodically so rebinding mid-session
 works.
+
+Applied, with a ten-second retry interval doing both jobs: a failed read is
+retried rather than cached, and a successful one is refreshed so rebinding a key
+mid-session is picked up. `Load` returns a bool and leaves the existing bindings
+alone on failure — a transient failure must not replace good bindings with none —
+and the error is logged once rather than every ten seconds.
 
 ### 5.8 [E] `Entry.OnFileOpen`'s bare `catch` hides real faults
 
@@ -1194,12 +1210,16 @@ with a crash report, and the settings are already the thing being lost.
 Still best effort. A force-quit reaches none of this, which is why §5.5 made the
 write atomic and §2.5 kept the deferral window at one second.
 
-### 5.10 [E] Missing `lua_checkstack` before multi-value pushes
+### 5.10 [E] ~~Missing `lua_checkstack` before multi-value pushes~~ — RESOLVED
 
 `src/SMLoader.Core/SettingsRegistry.cs:56-75` pushes six values. Lua guarantees
 `LUA_MINSTACK` (20) free slots on entry to a C function, so six is safe today —
 but a helper pushing a variable number (a future `settingChoices`) is not. Add
 `lua.EnsureStack(n)` wrapping `lua_checkstack` and use it in the API surface.
+
+`LuaState.EnsureStack` exists. Nothing needs it yet — the existing pushes are all
+fixed and small — so it is there for the first helper that pushes a variable
+number, which is the case that would otherwise corrupt the VM silently.
 
 ### 5.11 [E] `ToStringValue` on a number mutates the value in place
 
@@ -2001,12 +2021,28 @@ game and must never grow without limit.
 **The open/close cost is gone. The off-thread queue is not, and should not be
 until there is a shutdown path.**
 
-Both sides now hold their append handle open for the process lifetime — the shim
-in `log.cpp`, the managed side as a `FileStream` opened `bufferSize: 1` so one
-line is one write with nothing left sitting in a buffer. `FILE_APPEND_DATA`
-makes an append atomic against other appenders, so the two writers cannot
-interleave halfway through a line — which is what made keeping both safe, rather
-than needing the `BootContext` callback this item sketches.
+**The paragraph that used to be here was wrong, and the correction is the point
+of this item.**
+
+It claimed both sides could hold an append handle open because `FILE_APPEND_DATA`
+makes appends atomic against other appenders. That is true of the shim, which
+opens the handle itself. It is **not** true of .NET: `FileMode.Append` gives an
+ordinary write handle that is seeked to the end *once*, after which writes go to
+the stream's own tracked position. With both sides holding a handle the two
+positions diverge and each silently overwrites the other — in the session that
+caught it, **every `[shim]` line after `calling managed Boot` was gone from the
+log**, including the ones proving the path filter and the `lua_close` callback
+had been installed.
+
+That was found while trying to diagnose something else *using that log*, which is
+the worst way to find out your logging is lossy.
+
+So: the shim keeps its persistent handle, and the managed side reopens per line,
+which re-seeks to the real end every time. It costs an open/close on a path that
+§11.1 already made quiet, and a log that loses half its lines is worth nothing.
+Holding a managed handle would need a real `FILE_APPEND_DATA` handle via
+`CreateFile`, which is only worth doing alongside the `BootContext` callback this
+item actually sketches.
 
 The queue is the part left undone. Draining through a background thread takes
 logging off the game thread, but it also means **the last lines before a crash

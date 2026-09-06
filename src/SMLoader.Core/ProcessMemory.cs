@@ -204,6 +204,22 @@ internal sealed class ProcessMemory : IMemory
                 Array.IndexOf(ReadableFlags, info.Protect & 0xFF) >= 0)
             {
                 nint scanEnd = regionEnd < end ? regionEnd : end;
+
+                // Overlap into the next region by pattern.Length - 1 when that
+                // region is readable too. Clamping strictly to the region made a
+                // signature spanning two adjacent committed pages invisible, and
+                // the failure reads as "the game updated" rather than "we
+                // mis-scanned" - the expensive kind of wrong.
+                if (scanEnd == regionEnd && bytes.Length > 1)
+                {
+                    nint overlap = regionEnd + bytes.Length - 1;
+                    if (overlap > end)
+                        overlap = end;
+
+                    if (overlap > scanEnd && IsReadable(regionEnd, (int)(overlap - regionEnd)))
+                        scanEnd = overlap;
+                }
+
                 nint found = ScanRange(cursor, scanEnd, bytes, wildcard);
                 if (found != 0)
                     return found;

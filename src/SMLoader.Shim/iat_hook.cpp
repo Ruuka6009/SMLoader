@@ -6,6 +6,7 @@
 #include <winternl.h>
 #include <psapi.h>
 #include <cstring>
+#include <atomic>
 #include <cstdio>
 #include <vector>
 
@@ -17,7 +18,9 @@ using lua_pcall_t     = int (__cdecl*)(void*, int, int, int);
 void**          g_slot = nullptr;   // the IAT entry we patched
 luaL_newstate_t g_original = nullptr;
 
-void**          g_pcallSlot = nullptr;
+// Atomic: Detour_lua_pcall can retire the hook from more than one thread at
+// once, and the exchange is what makes exactly one of them do it.
+std::atomic<void**> g_pcallSlot{nullptr};
 lua_pcall_t     g_originalPcall = nullptr;
 
 using CreateFileW_t = HANDLE (__stdcall*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
@@ -109,7 +112,18 @@ HANDLE __stdcall Detour_CreateFileW(LPCWSTR fileName, DWORD access, DWORD share,
 {
     // Only reads are candidates for redirection; leaving writes alone means a
     // mistake here can never corrupt a game file.
-    if (fileName && (access & GENERIC_WRITE) == 0)
+    //
+    // GENERIC_WRITE alone does not detect a write: FILE_WRITE_DATA,
+    // FILE_APPEND_DATA, GENERIC_ALL and MAXIMUM_ALLOWED all grant write access
+    // without setting it, and a write opened that way would land in the
+    // loader's cache - the game writing to the wrong file, which is exactly
+    // what the sentence above says must be impossible.
+    //
+    // OPEN_EXISTING too, so a create or a truncate is never redirected.
+    constexpr DWORD kWriteBits = GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED
+                               | FILE_WRITE_DATA | FILE_APPEND_DATA;
+
+    if (fileName && (access & kWriteBits) == 0 && disposition == OPEN_EXISTING)
     {
         wchar_t replacement[1024]{};
         if (smloader::RedirectFileOpen(fileName, replacement, 1024))
@@ -576,11 +590,12 @@ void UnhookAll()
 
 void RetirePcallHook()
 {
-    if (!g_pcallSlot)
+    // Whoever wins the exchange owns the restore; everyone else sees null and
+    // leaves. Reading then clearing let two threads both act on the same slot.
+    void** slot = g_pcallSlot.exchange(nullptr, std::memory_order_acq_rel);
+    if (!slot)
         return;
 
-    void** slot = g_pcallSlot;
-    g_pcallSlot = nullptr;              // stop re-entry before we touch the slot
     WriteSlot(slot, reinterpret_cast<void*>(g_originalPcall));
     SMLOG("lua_pcall hook retired");
 }
