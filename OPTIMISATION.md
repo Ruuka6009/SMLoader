@@ -420,6 +420,29 @@ a shared cache would put a contended cache line on the render path to save a
 syscall on it. `TryUnprotect` and `Protect` clear it, since a deliberate
 protection change is exactly the case a stale descriptor would get wrong.
 
+**It shipped with a bug, and the bug is worth recording.** The first version
+cached every descriptor `VirtualQuery` returned. But a query against *free or
+reserved* address space answers with one descriptor spanning everything up to the
+next allocation — frequently gigabytes. Caching one of those makes every address
+inside it read as unreadable until the entry expires, including memory committed
+there a moment later. `bindCharacter`'s pointer-graph walk probes exactly such
+addresses, so it poisoned the cache for its own object; `Read<T>` then returned
+zeroes and `Write<T>` silently failed, which showed up in-game as noclip movement
+being dead on the first world load and fine after a reload.
+
+The log named it precisely — a render offset of exactly minus the world position
+is what a zero read looks like:
+
+```
+first load:   render offset (-4.23E+002, -1.02E+002, -1.407)
+after reload: render offset (0.00E+000, 0.00E+000, 0.000)
+```
+
+Only **committed, non-guard** regions are cached now. Those are the stable ones
+and the only ones on a path that matters; everything else asks the kernel every
+time, which costs nothing in practice. Guard pages are excluded because the flag
+clears on first touch.
+
 **What this does and does not cost.** It is easy to read the cache as trading
 safety for speed. It is not, quite. Querying immediately before dereferencing
 never made the dereference safe either — nothing holds the mapping still between
@@ -1369,7 +1392,7 @@ truncated. Append `…` when `_vsnprintf_s` returns `-1`.
 `FILE_SHARE_READ | FILE_SHARE_WRITE`, written with `FILE_APPEND_DATA`, which is
 atomic across processes — and flush on a timer. See §11.2.
 
-### 7.7 [Q] Build flags are not hardened
+### 7.7 [Q] ~~Build flags are not hardened~~ — RESOLVED, minus two flags
 
 `src/SMLoader.Shim/CMakeLists.txt` sets `/W4 /permissive-` and nothing else. For
 a DLL that gets injected into someone else's process:
@@ -1391,7 +1414,19 @@ redistributable as a deployment prerequisite. A user without it currently gets
 to load …" with nothing explaining why.
 
 `/Zi /DEBUG` in Release produces a PDB, which is what makes a user-submitted
-crash dump actionable.
+crash dump actionable — and `build.ps1` now stages it next to the DLL, because a
+PDB left in the build tree helps nobody.
+
+Two flags from the sketch are deliberately **not** applied:
+
+- **`/Qspectre`** needs the Spectre-mitigated runtime libraries, which are a
+  separate Visual Studio Installer component. Without them the build fails hard
+  with MSB8040. Requiring an extra install to build a mod loader is the worse
+  trade; add it back if the threat model ever warrants it.
+- **`/WX`** would mean a compiler upgrade that introduces one new warning stops a
+  player building the loader at all.
+
+Both reasons are comments in `CMakeLists.txt`, not just here.
 
 ### 7.8 [Q] No version resource on the DLL
 
@@ -1872,7 +1907,8 @@ The performance block is done. Next is hardening and tooling, starting at item
 
 20. §6.1 / §6.2 State the trust model; add `--no-mods` and an integrity check
 21. §7.1 SEH-guard the PE header walk
-22. §7.7 Harden the shim's build flags; static CRT; PDB in Release
+22. ~~§7.7 Harden the shim's build flags; static CRT; PDB in Release~~ — done,
+    minus `/WX` and `/Qspectre`; see the item for why
 23. §9.5 Turn analysers on and warnings into errors
 24. §10 A test project, starting with the pure functions
 25. §11 Log levels and a single buffered writer
