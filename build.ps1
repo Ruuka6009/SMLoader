@@ -34,6 +34,11 @@ if (-not (Test-Path $shimDll)) { throw "Shim not found at $shimDll" }
 Copy-Item $shimDll $dist -Force
 Write-Host "    -> $((Join-Path $dist 'SMLoader.Shim.dll'))"
 
+# The PDB is what makes a user-submitted crash dump readable; shipping the DLL
+# without it throws that away at the moment it is needed.
+$shimPdb = Join-Path $shimBuild "$Configuration\SMLoader.Shim.pdb"
+if (Test-Path $shimPdb) { Copy-Item $shimPdb $dist -Force }
+
 Write-Host "==> Building SMLoader.Core" -ForegroundColor Cyan
 dotnet build (Join-Path $root 'src\SMLoader.Core\SMLoader.Core.csproj') -c $Configuration -o $dist --nologo
 if ($LASTEXITCODE -ne 0) { throw "SMLoader.Core build failed" }

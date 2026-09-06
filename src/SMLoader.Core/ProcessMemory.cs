@@ -162,6 +162,23 @@ internal sealed class ProcessMemory : IMemory
             Filled = true,
         };
 
+        // ONLY committed, non-guard regions are cached, and the reason is a bug
+        // this caused: VirtualQuery on free or reserved address space answers
+        // with a single descriptor spanning everything up to the next
+        // allocation - frequently gigabytes. Caching one of those makes every
+        // address inside it read as unreadable for the lifetime of the entry,
+        // including memory committed there a moment later. A mod walking a
+        // pointer graph probes exactly such addresses, so it would poison the
+        // cache for its own object and then silently read zeroes and drop every
+        // write.
+        //
+        // Committed regions are the stable ones and the ones worth caching.
+        // Anything else goes to the kernel every time, which is correct and
+        // costs nothing on the paths that matter - those are all committed.
+        // Guard pages are excluded too: the flag clears on first touch.
+        if (info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD) != 0)
+            return true;
+
         // Newest at the front, oldest falls off the end.
         Array.Copy(cache, 0, cache, 1, cache.Length - 1);
         cache[0] = region;
