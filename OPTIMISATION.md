@@ -90,7 +90,7 @@ The single-writer design in
 [§11.2](#112-p-one-writer-buffered-off-the-game-thread) is still the better
 long-term answer; this removes the data loss in the meantime.
 
-### 1.3 [C] `luaL_ref` slots are keyed by a raw `lua_State*` that can be recycled
+### 1.3 [C] ~~`luaL_ref` slots are keyed by a raw `lua_State*` that can be recycled~~ — RESOLVED
 
 `src/SMLoader.Core/LuaApi.cs:15,62-81`
 
@@ -117,11 +117,38 @@ lua_rawgeti(L, LUA_REGISTRYINDEX, reference);
 if (!lua_istable(L, -1)) { lua_pop(L, 1); Evict(L); reference = GetOrCreateTable(L); /* ... */ }
 ```
 
-### 1.4 [C] `luaL_ref` can return a sentinel that is treated as a valid slot
+**RESOLVED**, both halves.
+
+`lua_close` is hooked in the exe's IAT alongside the other four
+(`Detour_lua_close`), and calls the managed side **before** the original — the
+registry has to still exist for the slot to be handed back. It travels through a
+new `BootContext::setLuaCloseCallback`, appended to the struct and gated on the
+`size` field that has always been there for exactly this; a Core paired with an
+older shim logs that references will be held and carries on.
+
+`OnLuaStateClosing` also drops the state from the shim's `g_pendingStates`, so a
+state closed before the CLR finished booting is never replayed as a dangling
+pointer.
+
+The advisory-cache-hit half is in `LuaApi.Seed`: the fetched value is checked
+with `lua_istable`, and on a miss the entry is **forgotten without a
+`luaL_unref`** — the stale reference names a slot in the *live* state's registry
+belonging to someone else, so releasing it would corrupt that state rather than
+fix ours. That distinction is the whole reason this bug is subtle.
+
+`LuaApi.Add` no longer clears the cache either. Clearing leaked every live
+state's slot, and unref'ing from `Add` is illegal because it runs on whichever
+thread the mod registered from, not the Lua thread. Entries now carry a
+generation; `Seed` sees the mismatch on the Lua thread and releases the old table
+there.
+
+### 1.4 [C] ~~`luaL_ref` can return a sentinel that is treated as a valid slot~~ — RESOLVED
 
 Same file, line 77. `luaL_ref` returns `LUA_REFNIL` (`-1`) when the value on top
-is nil and `LUA_NOREF` (`-2`) on failure. The code only rejects `0`. Reject
-anything `<= 0`, and log the case — it means the table build itself failed.
+is nil and `LUA_NOREF` (`-2`) on failure. The code only rejected `0`.
+
+Now rejected at `<= 0` and logged with the state address, in both
+`GetOrCreateTable` and its callers.
 
 ### 1.5 [C] Pattern matches that straddle a memory-region boundary are never found
 
@@ -178,7 +205,7 @@ This is a **breaking change** to `IMemory` for any mod compiled against 0.1.0,
 which is exactly the situation [§8.1](#81-c-there-is-no-api-version-handshake)
 describes.
 
-### 1.7 [C] `EnumProcessModules` truncation is not detected
+### 1.7 [C] ~~`EnumProcessModules` truncation is not detected~~ — RESOLVED
 
 `src/SMLoader.Shim/iat_hook.cpp:180-190`
 
@@ -196,7 +223,15 @@ if (!EnumProcessModules(GetCurrentProcess(), modules.data(),
     return;
 ```
 
-### 1.8 [C] Modules loaded after `HookFileApis` are never hooked
+Applied, with the returned count clamped to the vector's size in case more
+modules arrived between the two calls.
+
+§7.3 went with it: `GetModuleBaseNameW`'s return value is now checked, and a
+module whose name cannot be read is **skipped**. Previously a failed call left
+`name` zeroed, the `ntdll`/`kernel32` exclusions did not match, and the loop
+would hook exactly the module the comment above it says must never be hooked.
+
+### 1.8 [C] ~~Modules loaded after `HookFileApis` are never hooked~~ — RESOLVED
 
 Same function. It is a one-shot sweep on the boot thread. Any DLL the engine
 loads later (a renderer backend, an audio plug-in, a Steam module) keeps the
@@ -210,6 +245,30 @@ LdrRegisterDllNotification(0, &OnDllLoaded, nullptr, &g_cookie);
 resolved dynamically from `ntdll`. Do the actual hooking off the notification
 callback — the loader lock is held there, which is the same trap
 `HookFileApis` already documents for `DllMain`.
+
+**RESOLVED.** `SubscribeToModuleLoads` resolves `LdrRegisterDllNotification` from
+`ntdll` and registers `OnDllLoaded`; the notification structs are declared
+locally because the SDK only exposes them through the DDK.
+
+The loader-lock warning drove the shape of the callback. It patches **one**
+module's slot and nothing else:
+
+- it does not log — `log::Write` opens a file, which would re-enter our own
+  `CreateFileW` detour underneath the loader lock;
+- it does not allocate;
+- it does not ask psapi for the module name, using the `BaseDllName` the
+  notification already carries, copied out bounded rather than trusted to be
+  NUL-terminated.
+
+Because it cannot log, the count it hooks is exposed as
+`smloader::iat::LateHookedCount()` and reported by the existing `status at Ns`
+checkpoints — which is what [§11.5](#115-q-the-status-at-ns-checkpoints-are-a-good-idea-half-finished)
+asks those checkpoints to be for.
+
+Walking the headers of arbitrary just-loaded modules made
+[§7.1](#71-e-findiatslot-walks-arbitrary-module-headers-with-no-exception-guard)
+and [§7.2](#72-e-no-image_nt_optional_hdr64_magic-check) prerequisites rather
+than nice-to-haves, so both are done too.
 
 ### 1.9 [C] `GENERIC_WRITE` is not the only way to open a file for writing
 
@@ -234,7 +293,7 @@ if (fileName && (access & kWriteBits) == 0 && disposition == OPEN_EXISTING)
 Gating on `OPEN_EXISTING` as well means a create or truncate can never be
 redirected.
 
-### 1.10 [C] `ConcurrentDictionary.GetOrAdd` does not guarantee the factory runs once
+### 1.10 [C] ~~`ConcurrentDictionary.GetOrAdd` does not guarantee the factory runs once~~ — RESOLVED
 
 `src/SMLoader.Core/AssetPatcher.cs:53`
 
@@ -243,6 +302,9 @@ threads opening the same asset concurrently both run it, and both call
 `File.WriteAllText` on the same cache path — a torn or locked write. Use
 `GetOrAdd(path, static p => new Lazy<string?>(() => Build(p))).Value`, or a
 per-path lock.
+
+Applied: the cache is now `ConcurrentDictionary<string, Lazy<string?>>` with
+`LazyThreadSafetyMode.ExecutionAndPublication`.
 
 ### 1.11 [C] ~~`assembly.GetTypes()` throws away a partially loadable mod~~ — RESOLVED
 
@@ -649,7 +711,7 @@ waitable timer rather than a dedicated thread.
 
 ## 3. Memory and lifetime
 
-### 3.1 [C] `LuaState.Registered` grows without bound
+### 3.1 [C] ~~`LuaState.Registered` grows without bound~~ — RESOLVED
 
 `src/SMLoader.Api/Lua/LuaState.cs:23,75-82`
 
@@ -681,13 +743,24 @@ int id = Ids.GetOrAdd(function, static f =>
 
 A function pushed into ten states now costs one entry, not ten.
 
-### 3.2 [C] Registry references are never released
+Applied. `ReferenceEqualityComparer.Instance` could not be used directly —
+it is an `IEqualityComparer<object>` and `IEqualityComparer<T>` is invariant —
+so `LuaState` carries a four-line `ReferenceComparer` over
+`RuntimeHelpers.GetHashCode`.
+
+### 3.2 [C] ~~Registry references are never released~~ — RESOLVED
 
 `src/SMLoader.Core/LuaApi.cs:77` — `luaL_ref` with no matching `luaL_unref`.
-Each rebuild leaks a registry slot **and** keeps the old table (and its closures)
-alive in the Lua GC. The `lua_close` hook in §1.3 fixes both.
+Each rebuild leaked a registry slot **and** kept the old table (and its closures)
+alive in the Lua GC.
 
-### 3.3 [P] The asset-resolution cache is unbounded
+Fixed with [§1.3](#13-c-lual_ref-slots-are-keyed-by-a-raw-lua_state-that-can-be-recycled).
+There are now exactly two `luaL_unref` sites, and both are on the Lua thread:
+`Release`, from the `lua_close` detour, and `GetOrCreateTable`, when it rebuilds
+a table whose generation has fallen behind. The third case — a recycled address —
+deliberately does *not* unref; see §1.3.
+
+### 3.3 [P] ~~The asset-resolution cache is unbounded~~ — RESOLVED
 
 `src/SMLoader.Core/AssetPatcher.cs:23,53`
 
@@ -698,6 +771,16 @@ and out, that is tens of thousands of path strings held forever.
 Bound it: an LRU of a few thousand entries, or cache only the hits and use the
 native prefilter from §2.10 to make misses cheap without needing to remember
 them.
+
+**RESOLVED**, taking the shape of the second suggestion without waiting for
+§2.10. Above 4,096 entries `Trim` drops the misses and keeps the hits: a miss
+costs a handful of `string.Contains` calls to recompute, while a hit costs a file
+read, every mod's transform and a cache write — and there are only ever as many
+hits as the mods actually patch. A full `Clear` remains as the pathological
+fallback if the hits alone ever exceed the cap.
+
+A true LRU would be tighter, and is still the right answer if §2.10 lands and
+misses stop being cached at all.
 
 ### 3.4 [P] The cache directory is never cleaned
 
@@ -1093,7 +1176,7 @@ banned from a server will not remember the caveat in the README.
 
 ## 7. Native shim hardening
 
-### 7.1 [E] `FindIatSlot` walks arbitrary module headers with no exception guard
+### 7.1 [E] ~~`FindIatSlot` walks arbitrary module headers with no exception guard~~ — RESOLVED
 
 `src/SMLoader.Shim/iat_hook.cpp:112-152` dereferences `e_lfanew`, the NT headers,
 the import directory and every name thunk of **every module in the process**
@@ -1108,13 +1191,21 @@ __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 Plus explicit bounds: check `dir.VirtualAddress + dir.Size` against
 `nt->OptionalHeader.SizeOfImage`, and check each thunk RVA the same way.
 
-### 7.2 [E] No `IMAGE_NT_OPTIONAL_HDR64_MAGIC` check
+Both applied. The walk moved into `FindIatSlotUnguarded`, and `FindIatSlot` is
+now the `__try`/`__except` wrapper around it — which is why that function holds
+no C++ objects, and must not grow any. Every RVA is checked against
+`SizeOfImage` before it is turned into a pointer.
 
-Same function uses `IMAGE_NT_HEADERS` (the 64-bit form in an x64 build) without
+This stopped being optional the moment [§1.8](#18-c-modules-loaded-after-hookfileapis-are-never-hooked)
+started pointing the walk at arbitrary modules as they load.
+
+### 7.2 [E] ~~No `IMAGE_NT_OPTIONAL_HDR64_MAGIC` check~~ — RESOLVED
+
+Same function used `IMAGE_NT_HEADERS` (the 64-bit form in an x64 build) without
 verifying `nt->OptionalHeader.Magic`. A 32-bit module mapped as data would be
-misparsed. Cheap to check.
+misparsed. Checked now, with §7.1.
 
-### 7.3 [E] `GetModuleBaseNameW` return value is discarded
+### 7.3 [E] ~~`GetModuleBaseNameW` return value is discarded~~ — RESOLVED with [§1.7](#17-c-enumprocessmodules-truncation-is-not-detected)
 
 `iat_hook.cpp:195` — on failure `name` stays zeroed and the `_wcsicmp` exclusions
 silently do not match, so `ntdll` could be hooked after all, which is exactly
@@ -1611,10 +1702,14 @@ onward — the lifetime bugs.
 
 ### Do next — the lifetime bugs that surface after hours of play
 
-8. §1.3 / §3.2 Hook `lua_close`; unref and evict per state
-9. §3.1 Stop `LuaState.Registered` growing without bound
-10. §3.3 Bound the asset-resolution cache
-11. §1.7 / §1.8 Correct module enumeration; hook late-loaded modules
+8. ~~§1.3 / §3.2 Hook `lua_close`; unref and evict per state~~ — done, and §1.4 with it
+9. ~~§3.1 Stop `LuaState.Registered` growing without bound~~ — done
+10. ~~§3.3 Bound the asset-resolution cache~~ — done, and §1.10 with it
+11. ~~§1.7 / §1.8 Correct module enumeration; hook late-loaded modules~~ — done,
+    and §7.1 / §7.2 / §7.3 with it, since pointing the header walk at arbitrary
+    just-loaded modules made guarding it a prerequisite
+
+Next up is the performance block, starting at §2.1.
 
 ### Then — performance, in descending order of expected win
 

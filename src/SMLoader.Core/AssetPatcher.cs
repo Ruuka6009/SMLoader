@@ -19,8 +19,21 @@ internal static class AssetPatcher
 {
     private readonly record struct Registration(string ModName, string PathContains, Func<string, string> Transform);
 
+    /// <summary>
+    /// Above this many cached paths the misses are dropped. Once any mod
+    /// registers a transform, every path the process ever opens earns an
+    /// entry - worlds streaming in and out over a long session are tens of
+    /// thousands of strings, held for the life of the process.
+    /// </summary>
+    private const int MaxCachedPaths = 4096;
+
     private static readonly List<Registration> Registrations = new();
-    private static readonly ConcurrentDictionary<string, string?> Resolved = new(StringComparer.OrdinalIgnoreCase);
+
+    // Lazy, so two threads opening the same asset at once cannot both run the
+    // transform and both write the same cache file. GetOrAdd makes no promise
+    // that its factory runs once; the Lazy does.
+    private static readonly ConcurrentDictionary<string, Lazy<string?>> Resolved =
+        new(StringComparer.OrdinalIgnoreCase);
     private static readonly Lock Gate = new();
     private static string _cacheDirectory = "Cache";
 
@@ -50,7 +63,41 @@ internal static class AssetPatcher
         if (Registrations.Count == 0)
             return null;
 
-        return Resolved.GetOrAdd(path, Build);
+        if (Resolved.Count >= MaxCachedPaths)
+            Trim();
+
+        return Resolved.GetOrAdd(path, static p =>
+            new Lazy<string?>(() => Build(p), LazyThreadSafetyMode.ExecutionAndPublication)).Value;
+    }
+
+    /// <summary>
+    /// Drops the misses and keeps the hits. A miss costs a handful of string
+    /// comparisons to recompute; a hit costs a file read, every mod's transform
+    /// and a cache write, and there are only ever as many hits as the mods
+    /// actually patch.
+    /// </summary>
+    private static void Trim()
+    {
+        lock (Gate)
+        {
+            if (Resolved.Count < MaxCachedPaths)
+                return;
+
+            int before = Resolved.Count;
+            foreach (KeyValuePair<string, Lazy<string?>> entry in Resolved)
+            {
+                // Not yet evaluated means another thread is inside Build for it;
+                // dropping the entry is safe, that thread holds its own reference.
+                if (!entry.Value.IsValueCreated || entry.Value.Value is null)
+                    Resolved.TryRemove(entry.Key, out _);
+            }
+
+            // Pathological only: more genuine hits than the cap.
+            if (Resolved.Count >= MaxCachedPaths)
+                Resolved.Clear();
+
+            Logging.Write($"asset cache trimmed from {before} to {Resolved.Count} entries");
+        }
     }
 
     private static string? Build(string path)

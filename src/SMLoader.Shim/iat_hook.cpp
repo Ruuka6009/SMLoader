@@ -3,8 +3,10 @@
 #include "log.h"
 
 #include <winnt.h>
+#include <winternl.h>
 #include <psapi.h>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -28,6 +30,13 @@ lua_setfenv_t   g_originalSetfenv = nullptr;
 using luaL_loadbufferx_t = int (__cdecl*)(void*, const char*, size_t, const char*, const char*);
 void**             g_loadSlot = nullptr;
 luaL_loadbufferx_t g_originalLoad = nullptr;
+
+using lua_close_t = void (__cdecl*)(void*);
+void**        g_closeSlot = nullptr;
+lua_close_t   g_originalClose = nullptr;
+
+volatile long g_lateHooked = 0;
+void*         g_notificationCookie = nullptr;
 
 void* __cdecl Detour_luaL_newstate()
 {
@@ -67,6 +76,19 @@ int __cdecl Detour_luaL_loadbufferx(void* L, const char* buff, size_t sz,
         smloader::ReleaseScriptSource(replacement);
 
     return result;
+}
+
+void __cdecl Detour_lua_close(void* L)
+{
+    // Before the original, never after: the managed side has to release its
+    // registry references while the registry still exists. Once lua_close
+    // returns, the allocator is free to hand this same address back for the
+    // next state.
+    if (L)
+        smloader::OnLuaStateClosing(L);
+
+    if (g_originalClose)
+        g_originalClose(L);
 }
 
 int __cdecl Detour_lua_setfenv(void* L, int idx)
@@ -109,7 +131,12 @@ bool WriteSlot(void** slot, void* value)
 }
 
 // Locates the IAT slot for `importDll`!`importName` in `module`.
-void** FindIatSlot(HMODULE module, const char* importDll, const char* importName)
+//
+// Every dereference below is into a header we did not write, and since the
+// DLL load notification points this at arbitrary modules as they arrive, a
+// malformed or partially mapped image must not take the process down. The
+// SEH guard is why this function holds no C++ objects.
+void** FindIatSlotUnguarded(HMODULE module, const char* importDll, const char* importName)
 {
     auto* base = reinterpret_cast<BYTE*>(module);
     auto* dos  = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
@@ -120,27 +147,47 @@ void** FindIatSlot(HMODULE module, const char* importDll, const char* importName
     if (nt->Signature != IMAGE_NT_SIGNATURE)
         return nullptr;
 
-    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (dir.VirtualAddress == 0 || dir.Size == 0)
+    // IMAGE_NT_HEADERS is the 64-bit form in this build, so a 32-bit module
+    // mapped as data would be read through the wrong layout.
+    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
         return nullptr;
+
+    const DWORD imageSize = nt->OptionalHeader.SizeOfImage;
+
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (dir.VirtualAddress == 0 || dir.Size == 0 ||
+        dir.VirtualAddress > imageSize || dir.Size > imageSize - dir.VirtualAddress)
+    {
+        return nullptr;
+    }
 
     auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
     for (; desc->Name != 0; ++desc)
     {
+        if (desc->Name >= imageSize || desc->FirstThunk >= imageSize)
+            return nullptr;
+
         const char* dllName = reinterpret_cast<const char*>(base + desc->Name);
         if (_stricmp(dllName, importDll) != 0)
             continue;
 
         // OriginalFirstThunk holds the names; FirstThunk holds the resolved
         // addresses. They are parallel arrays, so one index serves both.
-        auto* nameThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
-            base + (desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk));
+        const DWORD namesRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk
+                                                        : desc->FirstThunk;
+        if (namesRva >= imageSize)
+            return nullptr;
+
+        auto* nameThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + namesRva);
         auto* addrThunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
 
         for (; nameThunk->u1.AddressOfData != 0; ++nameThunk, ++addrThunk)
         {
             if (IMAGE_SNAP_BY_ORDINAL(nameThunk->u1.Ordinal))
                 continue; // imported by ordinal, no name to match
+
+            if (nameThunk->u1.AddressOfData >= imageSize)
+                return nullptr;
 
             auto* byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
                 base + nameThunk->u1.AddressOfData);
@@ -151,9 +198,28 @@ void** FindIatSlot(HMODULE module, const char* importDll, const char* importName
     return nullptr;
 }
 
+void** FindIatSlot(HMODULE module, const char* importDll, const char* importName)
+{
+    if (!module)
+        return nullptr;
+
+    __try
+    {
+        return FindIatSlotUnguarded(module, importDll, importName);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+}
+
 // Patches kernel32!CreateFileW in one module's import table. Modules that do
 // not import it are skipped silently.
-bool HookCreateFileIn(HMODULE module, const wchar_t* moduleName)
+//
+// Logs nothing, because the DLL load notification calls it with the loader
+// lock held and log::Write opens a file - which would re-enter our own
+// CreateFileW detour underneath that lock.
+bool HookCreateFileInQuiet(HMODULE module, void*** hookedSlot)
 {
     void** slot = FindIatSlot(module, "KERNEL32.dll", "CreateFileW");
     if (!slot)
@@ -171,32 +237,137 @@ bool HookCreateFileIn(HMODULE module, const wchar_t* moduleName)
     if (!WriteSlot(slot, reinterpret_cast<void*>(&Detour_CreateFileW)))
         return false;
 
+    if (hookedSlot)
+        *hookedSlot = slot;
+    return true;
+}
+
+bool HookCreateFileIn(HMODULE module, const wchar_t* moduleName)
+{
+    void** slot = nullptr;
+    if (!HookCreateFileInQuiet(module, &slot))
+        return false;
+
     SMLOG("hooked CreateFileW in %ws (slot %p)", moduleName, static_cast<void*>(slot));
     return true;
 }
 
+// The subset of LDR_DLL_NOTIFICATION_DATA we need. Declared here because the
+// Windows SDK only exposes these through the DDK.
+struct LdrNotificationData {
+    ULONG                 Flags;
+    const UNICODE_STRING* FullDllName;
+    const UNICODE_STRING* BaseDllName;
+    PVOID                 DllBase;
+    ULONG                 SizeOfImage;
+};
+
+constexpr ULONG kDllLoaded = 1;
+
+using LdrNotificationCallback = VOID(CALLBACK*)(ULONG, const LdrNotificationData*, PVOID);
+using LdrRegisterDllNotification_t =
+    LONG(NTAPI*)(ULONG, LdrNotificationCallback, PVOID, PVOID*);
+
+// Runs with the loader lock held. Nothing here may log, allocate, or call
+// back into the loader - the same trap HookFileApis documents for DllMain.
+VOID CALLBACK OnDllLoaded(ULONG reason, const LdrNotificationData* data, PVOID)
+{
+    if (reason != kDllLoaded || !data || !data->DllBase)
+        return;
+
+    auto module = reinterpret_cast<HMODULE>(data->DllBase);
+    if (module == smloader::g_selfModule)
+        return;
+
+    // The notification carries the name, so there is no need to ask psapi for
+    // it here. Copy it out bounded rather than trusting NUL termination.
+    if (data->BaseDllName && data->BaseDllName->Buffer)
+    {
+        wchar_t name[64]{};
+        size_t chars = data->BaseDllName->Length / sizeof(wchar_t);
+        if (chars > 63)
+            chars = 63;
+        std::memcpy(name, data->BaseDllName->Buffer, chars * sizeof(wchar_t));
+
+        if (_wcsicmp(name, L"ntdll.dll") == 0 || _wcsicmp(name, L"kernel32.dll") == 0 ||
+            _wcsicmp(name, L"kernelbase.dll") == 0)
+        {
+            return;
+        }
+    }
+
+    if (HookCreateFileInQuiet(module, nullptr))
+        InterlockedIncrement(&g_lateHooked);
+}
+
+void SubscribeToModuleLoads()
+{
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll)
+        return;
+
+    auto reg = reinterpret_cast<LdrRegisterDllNotification_t>(
+        reinterpret_cast<void*>(GetProcAddress(ntdll, "LdrRegisterDllNotification")));
+    if (!reg)
+    {
+        SMLOG("LdrRegisterDllNotification unavailable; modules loaded from now on "
+              "will keep the real CreateFileW");
+        return;
+    }
+
+    const LONG status = reg(0, &OnDllLoaded, nullptr, &g_notificationCookie);
+    if (status != 0)
+        SMLOG("LdrRegisterDllNotification failed (0x%lx); late modules will not be hooked",
+              static_cast<unsigned long>(status));
+    else
+        SMLOG("subscribed to loader notifications for late-loaded modules");
+}
+
 void HookCreateFileEverywhere()
 {
-    HMODULE modules[512];
-    DWORD needed = 0;
+    const HANDLE self = GetCurrentProcess();
 
-    if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed))
+    // Size the list first. A fixed array silently truncates on a machine
+    // carrying overlays, input remappers and capture tools, and the symptom -
+    // some asset opens not redirected - looks machine-specific and random.
+    DWORD needed = 0;
+    if (!EnumProcessModules(self, nullptr, 0, &needed) || needed == 0)
+    {
+        SMLOG("EnumProcessModules sizing failed (%lu); asset redirection may be partial",
+              GetLastError());
+        return;
+    }
+
+    // Headroom, because a module can load between the two calls.
+    std::vector<HMODULE> modules(needed / sizeof(HMODULE) + 16);
+    if (!EnumProcessModules(self, modules.data(),
+                            static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &needed))
     {
         SMLOG("EnumProcessModules failed (%lu); asset redirection may be partial", GetLastError());
         return;
     }
 
-    const int count = static_cast<int>(needed / sizeof(HMODULE));
+    size_t count = needed / sizeof(HMODULE);
+    if (count > modules.size())
+        count = modules.size();
+
     int hooked = 0;
 
-    for (int i = 0; i < count; ++i)
+    for (size_t i = 0; i < count; ++i)
     {
-        wchar_t name[MAX_PATH]{};
-        GetModuleBaseNameW(GetCurrentProcess(), modules[i], name, MAX_PATH);
-
         // Never hook ourselves: our detour calls CreateFileW to write the log.
         if (modules[i] == smloader::g_selfModule)
             continue;
+
+        wchar_t name[MAX_PATH]{};
+        if (GetModuleBaseNameW(self, modules[i], name, MAX_PATH) == 0)
+        {
+            // Without a name there is no way to tell ntdll from a game module,
+            // and hooking the wrong one recurses during module load.
+            SMLOG("GetModuleBaseNameW failed for module %p (%lu); skipping it",
+                  static_cast<void*>(modules[i]), GetLastError());
+            continue;
+        }
 
         // Leave the OS core alone. Redirecting file opens made by ntdll or the
         // loader itself risks recursion during module load for no benefit - the
@@ -211,7 +382,7 @@ void HookCreateFileEverywhere()
             ++hooked;
     }
 
-    SMLOG("CreateFileW hooked in %d of %d module(s)", hooked, count);
+    SMLOG("CreateFileW hooked in %d of %zu module(s)", hooked, count);
 }
 
 
@@ -269,6 +440,21 @@ bool InstallLuaHooks()
         SMLOG("no IAT slot for lua_setfenv; scripts will not see the smloader table");
     }
 
+    g_closeSlot = FindIatSlot(exe, "lua51.dll", "lua_close");
+    if (g_closeSlot)
+    {
+        g_originalClose = reinterpret_cast<lua_close_t>(*g_closeSlot);
+        if (WriteSlot(g_closeSlot, reinterpret_cast<void*>(&Detour_lua_close)))
+            SMLOG("hooked lua_close (slot %p)", static_cast<void*>(g_closeSlot));
+        else
+            g_closeSlot = nullptr;
+    }
+    else
+    {
+        SMLOG("no IAT slot for lua_close; registry references will be held for "
+              "the life of the process");
+    }
+
     g_loadSlot = FindIatSlot(exe, "lua51.dll", "luaL_loadbufferx");
     if (g_loadSlot)
     {
@@ -307,6 +493,16 @@ void HookFileApis()
     // the shim at all. Called from the boot thread instead, which is well
     // before any GUI layout is read.
     HookCreateFileEverywhere();
+
+    // A one-shot sweep leaves every DLL the engine loads later - a renderer
+    // backend, an audio plug-in, a Steam module - holding the real
+    // CreateFileW, so its opens escape redirection.
+    SubscribeToModuleLoads();
+}
+
+int LateHookedCount()
+{
+    return static_cast<int>(g_lateHooked);
 }
 
 void RetirePcallHook()

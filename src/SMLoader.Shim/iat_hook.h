@@ -19,6 +19,13 @@ void RetirePcallHook();
 
 // Hooks CreateFileW across every loaded module so asset redirection also sees
 // files the CRT opens on the engine's behalf. Must run off the loader lock.
+// Also subscribes to loader notifications so modules loaded afterwards are
+// hooked as they arrive.
 void HookFileApis();
+
+// How many modules the loader notification has hooked since HookFileApis ran.
+// The notification callback cannot log - it holds the loader lock - so this
+// is how that work becomes visible.
+int LateHookedCount();
 
 }

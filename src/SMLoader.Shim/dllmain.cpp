@@ -24,6 +24,7 @@ ScriptLoadCallback       g_scriptLoad = nullptr;
 ScriptFreeCallback       g_scriptFree = nullptr;
 SetFenvCallback          g_setFenv = nullptr;
 FileOpenCallback         g_fileOpen = nullptr;
+LuaCloseCallback         g_closeCallback = nullptr;
 std::mutex               g_scriptMutex;
 
 } // namespace
@@ -64,6 +65,29 @@ void OnLuaStateCreated(void* L)
         callback = g_callback;
     }
     callback(L);
+}
+
+void SetLuaCloseCallback(LuaCloseCallback cb)
+{
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    g_closeCallback = cb;
+    SMLOG("lua_State teardown callback installed");
+}
+
+void OnLuaStateClosing(void* L)
+{
+    LuaCloseCallback callback = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        callback = g_closeCallback;
+
+        // A state queued for replay is about to stop existing; drop it so the
+        // managed side is never handed a dangling lua_State*.
+        for (auto it = g_pendingStates.begin(); it != g_pendingStates.end(); )
+            it = (*it == L) ? g_pendingStates.erase(it) : it + 1;
+    }
+    if (callback)
+        callback(L);
 }
 
 void SetLuaReadyCallback(LuaReadyCallback cb)
@@ -206,10 +230,11 @@ DWORD WINAPI BootThread(LPVOID)
     {
         Sleep((seconds - elapsed) * 1000);
         elapsed = seconds;
-        SMLOG("status at %ds: hook %s, lua_States seen %d",
+        SMLOG("status at %ds: hook %s, lua_States seen %d, late modules hooked %d",
               elapsed,
               smloader::iat::IsIntact() ? "intact" : "LOST",
-              smloader::SeenStateCount());
+              smloader::SeenStateCount(),
+              smloader::iat::LateHookedCount());
     }
     return 0;
 }

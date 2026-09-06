@@ -20,8 +20,24 @@ public delegate int LuaFunction(LuaState lua);
 /// </remarks>
 public sealed class LuaState
 {
-    private static readonly ConcurrentDictionary<int, LuaFunction> Registered = new();
+    // Keyed on the delegate itself, by reference. Minting a fresh id per push
+    // meant a function pushed into ten states per world load cost ten permanent
+    // entries, each rooting the delegate and through it the mod instance.
+    private static readonly ConcurrentDictionary<LuaFunction, int> Ids =
+        new(ReferenceComparer.Instance);
+    private static readonly ConcurrentDictionary<int, LuaFunction> ById = new();
     private static int _nextId;
+
+    private sealed class ReferenceComparer : IEqualityComparer<LuaFunction>
+    {
+        public static readonly ReferenceComparer Instance = new();
+
+        // Two delegates over the same method are still two registrations; only
+        // the same instance may share an id.
+        public bool Equals(LuaFunction? x, LuaFunction? y) => ReferenceEquals(x, y);
+
+        public int GetHashCode(LuaFunction obj) => RuntimeHelpers.GetHashCode(obj);
+    }
 
     public nint Handle { get; }
 
@@ -74,11 +90,18 @@ public sealed class LuaState
     /// <summary>Pushes a managed function onto the stack as a Lua C closure.</summary>
     public unsafe void Push(LuaFunction function)
     {
-        int id = Interlocked.Increment(ref _nextId);
-        Registered[id] = function;
+        // The same delegate pushed into a hundred states costs one entry.
+        int id = Ids.GetOrAdd(function, Mint);
 
         lua_pushinteger(Handle, id);
         lua_pushcclosure(Handle, (nint)(delegate* unmanaged[Cdecl]<nint, int>)&Trampoline, 1);
+    }
+
+    private static int Mint(LuaFunction function)
+    {
+        int id = Interlocked.Increment(ref _nextId);
+        ById[id] = function;
+        return id;
     }
 
     // ---- globals and tables ----------------------------------------------
@@ -147,7 +170,7 @@ public sealed class LuaState
         try
         {
             int id = (int)lua_tointeger(L, UpvalueIndex(1));
-            if (!Registered.TryGetValue(id, out LuaFunction? function))
+            if (!ById.TryGetValue(id, out LuaFunction? function))
                 return 0;
 
             return function(new LuaState(L));

@@ -24,6 +24,7 @@ public static class Entry
         public nint SetScriptLoadCallback; // void (*)(load, free)
         public nint SetSetFenvCallback;    // void (*)(void (*)(void* L))
         public nint SetFileOpenCallback;   // void (*)(int (*)(const wchar_t*, wchar_t*, int))
+        public nint SetLuaCloseCallback;   // void (*)(void (*)(void* L)) - added after 0.1.0
     }
 
     /// <summary>Raised on the game's thread for every lua_State it creates.</summary>
@@ -100,6 +101,20 @@ public static class Entry
             var installFileOpen = (delegate* unmanaged[Cdecl]<nint, void>)context.SetFileOpenCallback;
             installFileOpen((nint)(delegate* unmanaged[Cdecl]<nint, nint, int, int>)&OnFileOpen);
 
+            // BootContext.Size is what makes appending a callback safe: an older
+            // shim paired with this Core does not carry the field at all, and
+            // reading it would be reading past the struct it actually sent.
+            if (context.Size >= sizeof(BootContext) && context.SetLuaCloseCallback != 0)
+            {
+                var installClose = (delegate* unmanaged[Cdecl]<nint, void>)context.SetLuaCloseCallback;
+                installClose((nint)(delegate* unmanaged[Cdecl]<nint, void>)&OnLuaStateClosing);
+            }
+            else
+            {
+                Logging.Write("this shim predates the lua_close callback; registry " +
+                              "references will be held for the life of the process");
+            }
+
             return 0;
         }
         catch (Exception ex)
@@ -154,6 +169,26 @@ public static class Entry
         catch (Exception ex)
         {
             Logging.Error("a mod threw while handling a new lua_State", ex);
+        }
+    }
+
+    /// <summary>
+    /// Runs on the game's script thread just before the engine destroys a
+    /// state, while it is still valid. Releasing here is what stops a later
+    /// state - which the allocator may well place at this same address -
+    /// inheriting a reference into a registry that no longer exists.
+    /// </summary>
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static void OnLuaStateClosing(nint L)
+    {
+        try
+        {
+            LuaApi.Release(L);
+        }
+        catch (Exception ex)
+        {
+            // Never unwind into lua_close.
+            Logging.Error("releasing a closing lua_State failed", ex);
         }
     }
 

@@ -18,6 +18,12 @@ using ScriptLoadCallback = int(__cdecl*)(const char* name, const char* source, s
                                          const char** outSource, size_t* outLength);
 using ScriptFreeCallback = void(__cdecl*)(const char* buffer);
 
+// Called just before the game destroys a lua_State, while the state is still
+// valid, so the managed side can release the registry references it holds in
+// it. The allocator reuses addresses, so without this a later state can be
+// handed the same lua_State* and inherit a reference to a dead registry.
+using LuaCloseCallback = void(__cdecl*)(void* L);
+
 // Called with the environment table on top of the Lua stack, just before the
 // engine installs it on a script. The callback MUST leave the stack balanced.
 using SetFenvCallback = void(__cdecl*)(void* L);
@@ -35,12 +41,19 @@ struct BootContext {
     void (__cdecl* setScriptLoadCallback)(ScriptLoadCallback load, ScriptFreeCallback free);
     void (__cdecl* setSetFenvCallback)(SetFenvCallback cb);
     void (__cdecl* setFileOpenCallback)(FileOpenCallback cb);
+    // Appended after 0.1.0. Guarded by `size` on the managed side, which is
+    // what that field has always been for.
+    void (__cdecl* setLuaCloseCallback)(LuaCloseCallback cb);
 };
 
 extern HMODULE g_selfModule;
 
 // Called by the IAT detour whenever the game creates a lua_State.
 void OnLuaStateCreated(void* L);
+
+// Called by the lua_close detour before the state is destroyed.
+void OnLuaStateClosing(void* L);
+void SetLuaCloseCallback(LuaCloseCallback cb);
 
 // Installed by the managed side through BootContext::setLuaStateCallback.
 void SetLuaStateCallback(LuaStateCallback cb);

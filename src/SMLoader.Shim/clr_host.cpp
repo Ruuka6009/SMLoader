@@ -223,6 +223,7 @@ bool Start()
     context.setScriptLoadCallback = &SetScriptLoadCallback;
     context.setSetFenvCallback   = &SetSetFenvCallback;
     context.setFileOpenCallback  = &SetFileOpenCallback;
+    context.setLuaCloseCallback  = &SetLuaCloseCallback;
 
     SMLOG("calling managed Boot");
     const int bootResult = boot(&context);
