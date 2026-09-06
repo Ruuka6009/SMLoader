@@ -16,7 +16,6 @@ internal sealed class ProcessMemory : IMemory
     private const uint PAGE_GUARD = 0x100;
     private const uint MEM_COMMIT = 0x1000;
     private const uint PAGE_READWRITE = 0x04;
-    private const uint PAGE_EXECUTE_READWRITE = 0x40;
 
     private static readonly uint[] ReadableFlags =
     {
@@ -125,14 +124,33 @@ internal sealed class ProcessMemory : IMemory
         return cursor;
     }
 
-    public uint Unprotect(nint address, int size)
+    public bool TryUnprotect(nint address, int size, out uint previous)
     {
-        VirtualProtect(address, (nuint)size, PAGE_EXECUTE_READWRITE, out uint previous);
-        return previous;
+        previous = 0;
+        if (address == 0 || size <= 0)
+            return false;
+
+        // PAGE_READWRITE rather than PAGE_EXECUTE_READWRITE: the page only has
+        // to be writable while the patch is applied, and an RWX page left in
+        // the game's .text is both a W^X violation and an anti-cheat trigger.
+        if (VirtualProtect(address, (nuint)size, PAGE_READWRITE, out previous))
+            return true;
+
+        int error = Marshal.GetLastWin32Error();
+        previous = 0;
+        Logging.Error($"VirtualProtect failed at 0x{address:X} ({size} bytes), error {error}");
+        return false;
     }
 
-    public void Protect(nint address, int size, uint protection)
-        => VirtualProtect(address, (nuint)size, protection, out _);
+    public bool Protect(nint address, int size, uint protection)
+    {
+        // 0 is not a valid protection constant, so refuse it rather than making
+        // a call that fails and leaves the page writable without saying so.
+        if (protection == 0 || address == 0 || size <= 0)
+            return false;
+
+        return VirtualProtect(address, (nuint)size, protection, out _);
+    }
 
     public nint FindPattern(string pattern, string? moduleName = null)
     {

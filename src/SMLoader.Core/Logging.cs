@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace SMLoader.Core;
@@ -23,15 +24,26 @@ internal static class Logging
         {
             try
             {
-                File.AppendAllText(_path, line, Encoding.UTF8);
+                // FileShare.ReadWrite because the native shim appends to this
+                // same file. Anything less and one side loses its lines during
+                // boot, when both are chatty and a failure most needs both.
+                using var stream = new FileStream(_path, FileMode.Append, FileAccess.Write,
+                                                  FileShare.ReadWrite);
+                byte[] bytes = Encoding.UTF8.GetBytes(line);
+                stream.Write(bytes, 0, bytes.Length);
             }
             catch
             {
-                // Logging must never take the game down.
+                // Logging must never take the game down. The debugger channel
+                // is the fallback because it cannot fail.
+                OutputDebugStringW(line);
             }
         }
     }
 
     public static void Error(string message, Exception? exception = null)
         => Write(exception is null ? $"ERROR {message}" : $"ERROR {message}{Environment.NewLine}{exception}");
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern void OutputDebugStringW(string message);
 }

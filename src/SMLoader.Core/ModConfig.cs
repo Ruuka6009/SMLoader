@@ -70,13 +70,19 @@ internal sealed class ModConfig : IModConfig
     {
         lock (_gate)
         {
+            string temp = _path + ".tmp";
             try
             {
-                File.WriteAllText(_path, JsonSerializer.Serialize(_values, Options));
+                // Write-then-rename: File.WriteAllText truncates first, so a
+                // force-quit mid-write - routine with games - would leave the
+                // player with a zero-byte config and no settings.
+                File.WriteAllText(temp, JsonSerializer.Serialize(_values, Options));
+                File.Move(temp, _path, overwrite: true);
             }
             catch (Exception ex)
             {
                 Logging.Error($"could not write {_path}", ex);
+                try { File.Delete(temp); } catch { /* best effort */ }
             }
         }
     }

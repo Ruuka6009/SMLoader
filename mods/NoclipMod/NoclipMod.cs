@@ -760,9 +760,24 @@ public sealed class NoclipMod : IMod
             return;
         }
 
-        uint previous = host.Memory.Unprotect(jump, 2);
-        bool written = host.Memory.WriteBytes(jump, new byte[] { 0x90, 0x90 });
-        host.Memory.Protect(jump, 2, previous);
+        if (!host.Memory.TryUnprotect(jump, 2, out uint previous))
+        {
+            host.LogError($"{name}: could not make 0x{jump:X} writable - not patching");
+            return;
+        }
+
+        bool written;
+        try
+        {
+            written = host.Memory.WriteBytes(jump, new byte[] { 0x90, 0x90 });
+        }
+        finally
+        {
+            // Restoring in a finally is what keeps a page of the game's .text
+            // from staying writable for the rest of the session.
+            if (!host.Memory.Protect(jump, 2, previous))
+                host.LogError($"{name}: page left writable at 0x{jump:X}");
+        }
 
         host.Log(written
             ? $"{name}: player restriction lifted at 0x{jump:X} (jnz -> nop nop)"

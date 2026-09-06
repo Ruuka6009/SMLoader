@@ -52,11 +52,25 @@ public interface IMemory
     /// </summary>
     nint ReadChain(nint address, params int[] offsets);
 
-    /// <summary>Makes a range writable, returning the previous protection flags.</summary>
-    uint Unprotect(nint address, int size);
+    /// <summary>
+    /// Makes a range writable, reporting the previous protection flags. Returns
+    /// false when the range could not be unprotected, in which case nothing was
+    /// changed and <paramref name="previous"/> is meaningless.
+    /// </summary>
+    /// <remarks>
+    /// The range is made PAGE_READWRITE, not PAGE_EXECUTE_READWRITE: code does
+    /// not need to be executable while it is being written, and an RWX page in
+    /// a game process is what anti-cheat heuristics flag. Always restore the
+    /// captured protection through <see cref="Protect"/> in a finally block.
+    /// </remarks>
+    bool TryUnprotect(nint address, int size, out uint previous);
 
-    /// <summary>Restores protection flags previously returned by <see cref="Unprotect"/>.</summary>
-    void Protect(nint address, int size, uint protection);
+    /// <summary>
+    /// Restores protection flags previously captured by <see cref="TryUnprotect"/>.
+    /// Returns false if the restore failed - the page is then left writable, which
+    /// is worth logging.
+    /// </summary>
+    bool Protect(nint address, int size, uint protection);
 
     /// <summary>
     /// Formats a hex dump with ASCII, for working out an unknown struct layout.

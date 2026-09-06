@@ -36,38 +36,35 @@ Every item carries a severity and, where it matters, the exact site.
 
 ## 1. Correctness defects worth fixing first
 
-### 1.1 [C] The redirected asset path is not NUL-terminated
+### 1.1 [C] ~~The redirected asset path is not NUL-terminated~~ — RESOLVED, with a correction
 
-`src/SMLoader.Core/Entry.cs:264-268`
+The finding was **wrong on its central claim**, and the correction is worth more
+than the finding was. `Entry.cs:267` never assigned a space:
 
-```csharp
-fixed (char* source = replacement)
-    Buffer.MemoryCopy(source, (void*)outPtr, outChars * 2, (replacement.Length + 1) * 2);
-
-((char*)outPtr)[replacement.Length] = ' ';   // <-- overwrites the terminator
+```
+00000030: 3d20 2700 273b 0a                        = '.';.
 ```
 
-The `MemoryCopy` already copies `Length + 1` chars, and a fixed C# string is
-NUL-terminated in memory — so the copy lands a correct terminator, and the next
-line replaces it with a space. The receiving buffer is
-`wchar_t replacement[1024]` on the detour's stack (`iat_hook.cpp:91`),
-**uninitialised**, so what `CreateFileW` actually receives is
-`...\Options_MainMenu.layout ` followed by whatever was on the stack, until a
-stray zero word turns up.
+The source file held a **raw 0x00 byte between the quotes** — a valid C# NUL
+character literal that every editor, review tool and terminal renders as a
+space. The terminator was correct all along, written in the one form that cannot
+be reviewed. It also made git treat `Entry.cs` as binary, so `grep` refused to
+print matches from it.
 
-It appears to work only because Win32 path normalisation strips trailing spaces.
-It is a stack over-read on every redirected open, and it breaks the moment a
-path lands near the buffer limit or the stack garbage contains no NUL.
+Fixed by writing the escape, so the intent survives being read:
 
 ```csharp
 ((char*)outPtr)[replacement.Length] = '\0';
 ```
 
-Pair it with zero-initialising the native buffer:
+The second half of the finding was real and is also fixed: the receiving buffer
+`wchar_t replacement[1024]` on the detour's stack (`iat_hook.cpp:91`) was
+uninitialised, so any future path through that function that writes no
+terminator hands `CreateFileW` stack garbage. It is now `{}`-initialised.
 
-```cpp
-wchar_t replacement[1024]{};
-```
+**Lesson for the rest of this document:** a finding derived from reading source
+as rendered text can be defeated by a control character in that source. Where an
+item turns on an exact byte, check the bytes.
 
 ### 1.2 [C] Log writes race between the shim and the managed side, and both lose
 
@@ -81,8 +78,17 @@ one `CreateFileW` returns `INVALID_HANDLE_VALUE` (shim: silently returns) or one
 `File.AppendAllText` throws (core: silently swallowed by the `catch`). Lines are
 lost from the one file you would use to diagnose a failure.
 
-Fix both ends to `FILE_SHARE_READ | FILE_SHARE_WRITE` / `FileShare.ReadWrite`,
-or adopt the single-writer design in [§11.2](#112-p-one-writer-buffered-off-the-game-thread).
+**RESOLVED.** Both ends now open with `FILE_SHARE_READ | FILE_SHARE_WRITE`:
+`log.cpp` in both `Init` and `Write`, and `Logging.Write` through an explicit
+`FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)` in
+place of `File.AppendAllText`. The managed catch now falls back to
+`OutputDebugStringW` instead of swallowing the line, which also settles
+[§5.2](#52-e-boots-own-catch-can-throw): a failure inside `Logging.Initialize`
+can no longer lose its own report.
+
+The single-writer design in
+[§11.2](#112-p-one-writer-buffered-off-the-game-thread) is still the better
+long-term answer; this removes the data loss in the meantime.
 
 ### 1.3 [C] `luaL_ref` slots are keyed by a raw `lua_State*` that can be recycled
 
@@ -158,6 +164,20 @@ public bool Protect(nint address, int size, uint protection)
 
 and have `PatchGuard` refuse to write when the unprotect failed.
 
+**RESOLVED.** `IMemory` now exposes `bool TryUnprotect(nint, int, out uint)` and
+`bool Protect(nint, int, uint)`. `ProcessMemory` unprotects to `PAGE_READWRITE`
+rather than `PAGE_EXECUTE_READWRITE`, logs the Win32 error on failure, and
+refuses a `Protect` call carrying a 0 protection constant instead of making a
+call that silently fails. `NoclipMod.PatchGuard` returns early when the unprotect
+fails and restores the captured protection in a `finally`, logging if the page
+was left writable. That closes
+[§6.4](#64-s-wx-is-violated-during-the-guard-patch) with it — no page is ever
+RWX, and none is left writable.
+
+This is a **breaking change** to `IMemory` for any mod compiled against 0.1.0,
+which is exactly the situation [§8.1](#81-c-there-is-no-api-version-handshake)
+describes.
+
 ### 1.7 [C] `EnumProcessModules` truncation is not detected
 
 `src/SMLoader.Shim/iat_hook.cpp:180-190`
@@ -224,7 +244,7 @@ threads opening the same asset concurrently both run it, and both call
 `GetOrAdd(path, static p => new Lazy<string?>(() => Build(p))).Value`, or a
 per-path lock.
 
-### 1.11 [C] `assembly.GetTypes()` throws away a partially loadable mod
+### 1.11 [C] ~~`assembly.GetTypes()` throws away a partially loadable mod~~ — RESOLVED
 
 `src/SMLoader.Core/ModLoader.cs:62`
 
@@ -242,12 +262,19 @@ catch (ReflectionTypeLoadException ex)
 }
 ```
 
-### 1.12 [C] One bad `IMod` aborts the remaining mods in the same assembly
+Applied as `ModLoader.GetLoadableTypes`.
 
-Same file, lines 62-75. `Activator.CreateInstance` and `mod.OnLoad` sit inside a
+### 1.12 [C] ~~One bad `IMod` aborts the remaining mods in the same assembly~~ — RESOLVED
+
+Same file, lines 62-75. `Activator.CreateInstance` and `mod.OnLoad` sat inside a
 single `try` wrapping the whole type loop. A throwing constructor in the first
-type prevents the second from ever being seen, and the log reports it as a
-single mod failure. Move the `try` inside the loop.
+type prevented the second from ever being seen, and the log reported it as a
+single mod failure.
+
+`LoadFrom` is now two phases: one `try` around loading the assembly and
+enumerating its types — a failure there skips the mod — then a per-type `try`
+around construction and `OnLoad`, which names the offending type in the log
+rather than blaming the whole mod.
 
 ---
 
@@ -803,7 +830,7 @@ The project already does the hard part well: every native→managed callback is
 wrapped, `LuaState.ErrorSink` exists, transforms are individually caught, and
 logging swallows its own failures. The gaps are at the edges.
 
-### 5.1 [E] No global unhandled-exception handler
+### 5.1 [E] ~~No global unhandled-exception handler~~ — RESOLVED
 
 Nothing subscribes to `AppDomain.CurrentDomain.UnhandledException` or
 `TaskScheduler.UnobservedTaskException`. An exception on a background thread
@@ -817,7 +844,12 @@ TaskScheduler.UnobservedTaskException += (_, e) =>
     { Logging.Error("unobserved task exception", e.Exception); e.SetObserved(); };
 ```
 
-Install these as the **first** thing `Boot` does, before `Logging.Initialize`.
+Installed as `Entry.InstallProcessWideHandlers`, called as the first statement of
+`Boot` — ahead of the null-context check and of `Logging.Initialize`, so the
+window in which a background exception is invisible is as small as it can be. The
+install is `Interlocked`-guarded, since a second `Boot` would otherwise subscribe
+twice. `IsTerminating` is logged, because in the terminating case that line is the
+only record there will be.
 
 ### 5.2 [E] `Boot`'s own catch can throw
 
@@ -861,7 +893,7 @@ Also validate that `Kind` and `T` agree (`SettingKind.Toggle` with `T = string`
 is a bug the loader can catch at declaration time), and that a `Choice` setting
 has a non-empty `Choices` list.
 
-### 5.5 [E] `ModConfig.Save` is not crash-atomic
+### 5.5 [E] ~~`ModConfig.Save` is not crash-atomic~~ — RESOLVED
 
 `src/SMLoader.Core/ModConfig.cs:75` — `File.WriteAllText` truncates first. A crash
 or a force-quit (common with games) between truncate and write leaves a zero-byte
@@ -873,6 +905,9 @@ string temp = _path + ".tmp";
 File.WriteAllText(temp, json);
 File.Move(temp, _path, overwrite: true);   // atomic rename on NTFS
 ```
+
+Applied, with the temp file deleted on a failed write so a full disk does not
+leave `.tmp` files accumulating beside the configs.
 
 ### 5.6 [E] `Get<T>` swallows the deserialisation error silently
 
@@ -979,7 +1014,7 @@ containing a quote changes the parse of everything after it. Low severity — th
 user supplies their own arguments — but it is one helper away from correct:
 apply the standard `CommandLineToArgvW` quoting rules per argument.
 
-### 6.4 [S] W^X is violated during the guard patch
+### 6.4 [S] ~~W^X is violated during the guard patch~~ — RESOLVED with [§1.6](#16-c-unprotect-ignores-failure-and-protect-can-leave-a-page-rwx)
 
 `mods/NoclipMod/NoclipMod.cs` `PatchGuard` (via `ProcessMemory.Unprotect`) sets
 `PAGE_EXECUTE_READWRITE` on a page of the game's `.text`. Combined with §1.6,
@@ -1557,13 +1592,22 @@ hooks rather than only `luaL_newstate`.
 
 ### Do first — correctness, cheap, high consequence
 
-1. §1.1 NUL-terminate the redirected path; zero-init the native buffer
-2. §1.2 Fix log file sharing on both sides
-3. §1.6 / §6.4 Make `Unprotect`/`Protect` report failure; stop leaving RWX pages
-4. §5.1 Global unhandled-exception handlers
-5. §1.11 / §1.12 Isolate mod load failures per type
-6. §5.5 Atomic config writes
+1. ~~§1.1 NUL-terminate the redirected path; zero-init the native buffer~~ — done
+   (the terminator was already there, written as a raw NUL byte; see the item)
+2. ~~§1.2 Fix log file sharing on both sides~~ — done, and §5.2 with it
+3. ~~§1.6 / §6.4 Make `Unprotect`/`Protect` report failure; stop leaving RWX pages~~ — done
+4. ~~§5.1 Global unhandled-exception handlers~~ — done
+5. ~~§1.11 / §1.12 Isolate mod load failures per type~~ — done
+6. ~~§5.5 Atomic config writes~~ — done
 7. ~~§9.1 / §9.2 Remove the JVM dumps and `.idea/` from git~~ — done
+
+Found while doing the above, and fixed: the repository's blobs are stored with
+CRLF while `core.autocrlf` is `true`, so a one-line edit to any file diffed as a
+whole-file rewrite. A `.gitattributes` with `* -text` settles it, and is the
+reason the diffs for this batch are readable.
+
+The next block is [§1.3 / §3.2](#13-c-lual_ref-slots-are-keyed-by-a-raw-lua_state-that-can-be-recycled)
+onward — the lifetime bugs.
 
 ### Do next — the lifetime bugs that surface after hours of play
 

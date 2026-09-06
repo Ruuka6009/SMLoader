@@ -32,12 +32,19 @@ public static class Entry
     private static ModLoader? _modLoader;
     private static List<string> _splash = new();
     private static int _splashEchoed;
+    private static int _handlersInstalled;
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     public static unsafe int Boot(nint contextPtr)
     {
         try
         {
+            // Before anything else, including Logging.Initialize: an exception
+            // on a background thread terminates the game process, and without
+            // these the player sees a crash with nothing in smloader.log to
+            // distinguish it from the game's own.
+            InstallProcessWideHandlers();
+
             if (contextPtr == 0)
                 return 1;
 
@@ -100,6 +107,27 @@ public static class Entry
             Logging.Error("boot failed", ex);
             return 1;
         }
+    }
+
+    /// <summary>
+    /// Last-chance logging for exceptions that escape a thread SMLoader does
+    /// not own the top of. Neither handler can prevent the terminating case -
+    /// they exist so the reason is on disk before the process goes.
+    /// </summary>
+    private static void InstallProcessWideHandlers()
+    {
+        if (Interlocked.Exchange(ref _handlersInstalled, 1) != 0)
+            return;
+
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            Logging.Error($"FATAL unhandled exception (terminating: {e.IsTerminating})",
+                          e.ExceptionObject as Exception);
+
+        TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            Logging.Error("unobserved task exception", e.Exception);
+            e.SetObserved();
+        };
     }
 
     private static string DescribeMods()
@@ -264,7 +292,9 @@ public static class Entry
             fixed (char* source = replacement)
                 Buffer.MemoryCopy(source, (void*)outPtr, outChars * 2, (replacement.Length + 1) * 2);
 
-            ((char*)outPtr)[replacement.Length] = ' ';
+            // The copy above already lands the string's own terminator; write it
+            // again explicitly rather than relying on a raw NUL byte in this file.
+            ((char*)outPtr)[replacement.Length] = '\0';
             return 1;
         }
         catch

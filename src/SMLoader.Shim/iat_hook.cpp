@@ -88,7 +88,7 @@ HANDLE __stdcall Detour_CreateFileW(LPCWSTR fileName, DWORD access, DWORD share,
     // mistake here can never corrupt a game file.
     if (fileName && (access & GENERIC_WRITE) == 0)
     {
-        wchar_t replacement[1024];
+        wchar_t replacement[1024]{};
         if (smloader::RedirectFileOpen(fileName, replacement, 1024))
             fileName = replacement;
     }

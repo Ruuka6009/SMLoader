@@ -22,7 +22,11 @@ void Init()
     g_logPath = std::wstring(RootDir()) + L"smloader.log";
 
     // Truncate on each launch so the log always describes the current run.
-    HANDLE h = CreateFileW(g_logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+    // Share writes as well as reads: the managed side appends to this same
+    // file, and denying it a handle silently loses the lines that explain a
+    // failed boot.
+    HANDLE h = CreateFileW(g_logPath.c_str(), GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
                            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h != INVALID_HANDLE_VALUE)
         CloseHandle(h);
@@ -52,7 +56,8 @@ void Write(const char* fmt, ...)
     if (g_logPath.empty())
         return;
 
-    HANDLE h = CreateFileW(g_logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+    HANDLE h = CreateFileW(g_logPath.c_str(), FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE)
         return;

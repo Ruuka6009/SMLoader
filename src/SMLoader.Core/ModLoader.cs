@@ -51,6 +51,7 @@ internal sealed class ModLoader
             }
         }
 
+        Type[] types;
         try
         {
             var context = new ModLoadContext(assemblyPath);
@@ -58,14 +59,25 @@ internal sealed class ModLoader
             // Loaded from memory rather than by path: a running game would
             // otherwise hold the file open and block the next mod rebuild.
             Assembly assembly = LoadWithoutLocking(context, assemblyPath);
+            types = GetLoadableTypes(assembly, name);
+        }
+        catch (Exception ex)
+        {
+            Logging.Error($"failed to load mod '{name}'", ex);
+            return;
+        }
 
-            foreach (Type type in assembly.GetTypes())
+        foreach (Type type in types)
+        {
+            if (type.IsAbstract || type.IsInterface || !typeof(IMod).IsAssignableFrom(type))
+                continue;
+            if (type.GetConstructor(Type.EmptyTypes) is null)
+                continue;
+
+            // Per type, not per assembly: a throwing constructor in the first
+            // IMod must not hide the ones after it.
+            try
             {
-                if (type.IsAbstract || type.IsInterface || !typeof(IMod).IsAssignableFrom(type))
-                    continue;
-                if (type.GetConstructor(Type.EmptyTypes) is null)
-                    continue;
-
                 var mod = (IMod)Activator.CreateInstance(type)!;
                 var host = new ModHost(_root, mod.Name);
 
@@ -73,10 +85,28 @@ internal sealed class ModLoader
                 _loaded.Add(mod);
                 Logging.Write($"loaded {mod.Name} {mod.Version} from {Path.GetFileName(assemblyPath)}");
             }
+            catch (Exception ex)
+            {
+                Logging.Error($"failed to load '{type.FullName}' from mod '{name}'", ex);
+            }
         }
-        catch (Exception ex)
+    }
+
+    /// <summary>
+    /// A mod whose assembly references a type it cannot resolve still has a
+    /// perfectly loadable IMod in it most of the time, so keep what did load
+    /// instead of discarding the whole assembly.
+    /// </summary>
+    private static Type[] GetLoadableTypes(Assembly assembly, string name)
+    {
+        try
         {
-            Logging.Error($"failed to load mod '{name}'", ex);
+            return assembly.GetTypes();
+        }
+        catch (ReflectionTypeLoadException ex)
+        {
+            Logging.Error($"{name}: some types failed to load", ex);
+            return ex.Types.Where(t => t is not null).ToArray()!;
         }
     }
 

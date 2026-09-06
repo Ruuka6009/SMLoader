@@ -1,0 +1,3 @@
+# Windows-only project. Normalise to LF in the repository, CRLF in the
+# working tree, so a one-line edit no longer diffs as a whole-file rewrite.
+* text=auto eol=crlf
