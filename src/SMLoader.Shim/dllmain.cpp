@@ -105,7 +105,21 @@ void OnLuaStateCreated(void* L)
         if (!callback)
         {
             // The CLR has not booted yet; replay this state once it has.
-            g_pendingStates.push_back(L);
+            //
+            // Capped, because "not yet" and "never" look identical from here:
+            // if clr::Start failed, every state the game ever creates would be
+            // pushed into a vector nothing drains.
+            constexpr size_t kMaxPending = 16;
+            if (g_pendingStates.size() < kMaxPending)
+            {
+                g_pendingStates.push_back(L);
+            }
+            else if (g_pendingStates.size() == kMaxPending)
+            {
+                g_pendingStates.push_back(nullptr);   // marks the cap, logged once
+                SMLOG("more than %zu lua_States queued and the CLR has not booted; "
+                      "no further states will be replayed", kMaxPending);
+            }
             return;
         }
     }
@@ -277,8 +291,12 @@ void SetLuaStateCallback(LuaStateCallback cb)
     SMLOG("managed lua_State callback installed; replaying %zu state(s)", replay.size());
     if (!cb)
         return;
+
     for (void* L : replay)
-        cb(L);
+    {
+        if (L)   // the cap marker
+            cb(L);
+    }
 }
 
 } // namespace smloader
@@ -317,7 +335,19 @@ DWORD WINAPI BootThread(LPVOID)
     }
 
     smloader::iat::HookFileApis();
-    smloader::clr::Start();
+
+    if (!smloader::clr::Start())
+    {
+        // Leaving the detours in place would add cost to every luaL_newstate,
+        // lua_pcall, luaL_loadbufferx, lua_setfenv and CreateFileW for the rest
+        // of the session while doing nothing at all. A player whose .NET install
+        // is broken should get a game that runs exactly as fast as an unmodded
+        // one, and one line saying why.
+        SMLOG("the managed side did not start; removing every hook so the game "
+              "runs unmodified");
+        smloader::iat::UnhookAll();
+        return 0;
+    }
 
     // Scrap Mechanic does not create a lua_State until a world loads, so a
     // quiet log is expected at the main menu. These checkpoints make the

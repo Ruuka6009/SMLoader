@@ -108,6 +108,16 @@ internal sealed class ProcessMemory : IMemory
             return false;
 
         Marshal.Copy(bytes, 0, address, bytes.Length);
+
+        // x64 keeps the instruction cache coherent with stores, so this works
+        // without it - but the documented contract for modifying code requires
+        // the flush, and this is the call mods use to patch instructions.
+        //
+        // What this does NOT do is make the patch safe against a thread already
+        // executing those exact bytes. For the aligned two-byte writes
+        // NoclipMod does the risk is very low; anything wider needs the other
+        // threads suspended first.
+        FlushInstructionCache(GetCurrentProcess(), address, (nuint)bytes.Length);
         return true;
     }
 
@@ -334,4 +344,11 @@ internal sealed class ProcessMemory : IMemory
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern nint GetModuleHandleW(string moduleName);
+
+    [DllImport("kernel32.dll")]
+    private static extern nint GetCurrentProcess();
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool FlushInstructionCache(nint process, nint address, nuint size);
 }

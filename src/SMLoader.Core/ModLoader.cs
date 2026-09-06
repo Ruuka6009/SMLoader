@@ -280,14 +280,15 @@ internal sealed class ModLoader
 
     private static Assembly LoadWithoutLocking(AssemblyLoadContext context, string assemblyPath)
     {
-        using var image = new MemoryStream(File.ReadAllBytes(assemblyPath));
+        // writable: false wraps the array rather than copying it again.
+        using var image = new MemoryStream(File.ReadAllBytes(assemblyPath), writable: false);
 
         string symbolsPath = Path.ChangeExtension(assemblyPath, ".pdb");
         if (!File.Exists(symbolsPath))
             return context.LoadFromStream(image);
 
         // Carrying the pdb keeps line numbers in mod stack traces.
-        using var symbols = new MemoryStream(File.ReadAllBytes(symbolsPath));
+        using var symbols = new MemoryStream(File.ReadAllBytes(symbolsPath), writable: false);
         return context.LoadFromStream(image, symbols);
     }
 

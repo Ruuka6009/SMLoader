@@ -284,13 +284,14 @@ public sealed class NoclipMod : IMod
 
             // Preferred: ask the engine's own resolver, then confirm the answer
             // against the position the game reported for this character.
-            if (_resolveCharacter is not null)
+            ResolveCharacterDelegate? resolve = Volatile.Read(ref _resolveCharacter);
+            if (resolve is not null)
             {
                 nint slot = Marshal.AllocHGlobal(16);
                 try
                 {
                     Marshal.WriteIntPtr(slot, 0);
-                    _resolveCharacter(slot, lua.Handle, 1);
+                    resolve(slot, lua.Handle, 1);
                     nint resolved = Marshal.ReadIntPtr(slot);
 
                     if (MatchesPosition(host, resolved, reported))
@@ -747,6 +748,11 @@ public sealed class NoclipMod : IMod
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void ResolveCharacterDelegate(nint result, nint luaState, int index);
 
+    /// <summary>
+    /// Assigned on the loader thread by CaptureCharacterResolver and read on the
+    /// game thread in bindCharacter. OnLoad completes long before the first read
+    /// in practice; the Volatile pair costs nothing and states the handoff.
+    /// </summary>
     private ResolveCharacterDelegate? _resolveCharacter;
 
     /// <summary>
@@ -766,7 +772,8 @@ public sealed class NoclipMod : IMod
         }
 
         nint resolver = call + 5 + host.Memory.Read<int>(call + 1);
-        _resolveCharacter = Marshal.GetDelegateForFunctionPointer<ResolveCharacterDelegate>(resolver);
+        Volatile.Write(ref _resolveCharacter,
+                       Marshal.GetDelegateForFunctionPointer<ResolveCharacterDelegate>(resolver));
         host.Log($"character resolver at 0x{resolver:X}");
     }
 

@@ -945,7 +945,7 @@ ever deletes it. Stale entries survive a mod being uninstalled, and a stale
 `.layout` will still be served. Stamp each entry with the source file's mtime
 plus a hash of the active registration set, and sweep the directory at boot.
 
-### 3.5 [C] `g_pendingStates` is unbounded if the CLR never boots
+### 3.5 [C] ~~`g_pendingStates` is unbounded if the CLR never boots~~ — RESOLVED
 
 `src/SMLoader.Shim/dllmain.cpp:17,52-67`
 
@@ -953,7 +953,10 @@ If `clr::Start()` fails — no .NET runtime installed, a bad
 `runtimeconfig.json` — every `lua_State` the game creates is pushed into a vector
 that is never drained. Cap it (16 is generous) and log once when the cap is hit.
 
-### 3.6 [Q] `MemoryStream` over `File.ReadAllBytes` copies the assembly twice
+Applied. A null sentinel is pushed at the cap so the log line happens exactly
+once, and the replay loop skips it.
+
+### 3.6 [Q] ~~`MemoryStream` over `File.ReadAllBytes` copies the assembly twice~~ — RESOLVED
 
 `src/SMLoader.Core/ModLoader.cs:85`. Minor:
 `new MemoryStream(bytes, writable: false)` avoids one copy. The streams are
@@ -1051,18 +1054,23 @@ to a native-side exclusion list (§2.10).
 carries defined ordering; `volatile` in C++ carries no threading semantics at
 all.
 
-### 4.7 [C] `_resolveCharacter` is published without a barrier
+### 4.7 [C] ~~`_resolveCharacter` is published without a barrier~~ — RESOLVED
 
 `mods/NoclipMod/NoclipMod.cs` — assigned on the loader thread by
 `CaptureCharacterResolver`, read on the game thread in `bindCharacter`, with no
 `volatile`. In practice `OnLoad` completes long before, but a
 `Volatile.Write`/`Volatile.Read` pair costs nothing and documents the handoff.
 
-### 4.8 [E] `Entry._splash` is a mutable static crossing threads
+### 4.8 [E] ~~`Entry._splash` is a mutable static crossing threads~~ — RESOLVED
 
 `src/SMLoader.Core/Entry.cs:33` — built on the boot thread, read on the game
 thread in `EchoSplashToGameLog`. Publish it once as an
 `ImmutableArray<string>` with `Volatile.Write`.
+
+Applied as a `string[]` rather than an `ImmutableArray<string>` — the array is
+never handed out, so immutability would be documentation the type system already
+gives here. The list is built locally and published once, finished, so the reader
+sees either the old array or a complete new one and never a list mid-`Add`.
 
 ---
 
@@ -1101,7 +1109,7 @@ the write may fail. It is caught inside `Logging.Write`, so this is safe today �
 make it explicit with a fallback to `OutputDebugStringW` via P/Invoke, which
 cannot fail.
 
-### 5.3 [E] A failed CLR boot leaves the hooks installed and inert
+### 5.3 [E] ~~A failed CLR boot leaves the hooks installed and inert~~ — RESOLVED
 
 `src/SMLoader.Shim/dllmain.cpp:198` — `clr::Start()`'s return value is discarded.
 The detours stay in place, adding cost to every `luaL_newstate`, `lua_pcall`,
@@ -1109,6 +1117,10 @@ The detours stay in place, adding cost to every `luaL_newstate`, `lua_pcall`,
 while doing nothing at all. On failure, **unhook everything** and log one clear
 line. A player whose .NET install is broken should get a game that runs exactly
 as fast as an unmodded one.
+
+Applied. `clr::Start`'s result is checked, and on failure `UnhookAll` — written
+for [§7.4](#74-e-the-shim-never-unhooks) — is exactly the tool this needed, which
+is a good sign both items were real.
 
 ### 5.4 [E] ~~`Declare<T>`'s `Convert.ChangeType` can throw and kill a mod load~~ — RESOLVED
 
@@ -1176,11 +1188,14 @@ mid-session is picked up. `Load` returns a bool and leaves the existing bindings
 alone on failure — a transient failure must not replace good bindings with none —
 and the error is logged once rather than every ten seconds.
 
-### 5.8 [E] `Entry.OnFileOpen`'s bare `catch` hides real faults
+### 5.8 [E] ~~`Entry.OnFileOpen`'s bare `catch` hides real faults~~ — RESOLVED
 
 `src/SMLoader.Core/Entry.cs:270-273` — `catch { return 0; }` on the hottest
 managed path. Correct as a policy, but a *persistent* failure is invisible. Count
 failures, log the first, then one line per thousand.
+
+Applied verbatim, with the exception itself included, since the first failure is
+the one that explains the other nine hundred and ninety-nine.
 
 ### 5.9 [E] ~~No graceful shutdown~~ — RESOLVED
 
@@ -1221,12 +1236,17 @@ but a helper pushing a variable number (a future `settingChoices`) is not. Add
 fixed and small — so it is there for the first helper that pushes a variable
 number, which is the case that would otherwise corrupt the VM silently.
 
-### 5.11 [E] `ToStringValue` on a number mutates the value in place
+### 5.11 [E] ~~`ToStringValue` on a number mutates the value in place~~ — RESOLVED
 
 `src/SMLoader.Api/Lua/LuaState.cs:38-47` — `lua_tolstring` converts a number to a
 string *in the stack slot*. Doing that to a key during a `lua_next` traversal
 breaks the traversal. Document it on the method and add a `ToStringValueSafe`
 that pushes a copy first.
+
+Applied as `ToStringValueCopy`, which pushes a copy, converts that, and pops —
+leaving the original slot untouched and the stack balanced. The mutation is now
+documented on `ToStringValue` itself, including *why* it matters: a `lua_next`
+traversal breaks when a key changes type underneath it.
 
 ### 5.12 [E] The `smloader` table can be `nil` in injected Lua and nothing checks
 
@@ -1326,7 +1346,7 @@ try { memory.WriteBytes(jump, new byte[] { 0x90, 0x90 }); }
 finally { if (!memory.Protect(jump, 2, previous)) host.LogError($"page left writable at 0x{jump:X}"); }
 ```
 
-### 6.5 [S] Code is patched with no `FlushInstructionCache` and no thread suspension
+### 6.5 [S] ~~Code is patched with no `FlushInstructionCache` and no thread suspension~~ — RESOLVED
 
 Same site. x86/x64 keeps the instruction cache coherent with stores, so this
 works in practice — but the documented contract requires
@@ -1334,6 +1354,13 @@ works in practice — but the documented contract requires
 and another thread could be executing the exact two bytes being replaced. For an
 aligned two-byte write the risk is very low; add the flush, document the
 assumption, and suspend other threads if this ever grows beyond two bytes.
+
+The flush is in `ProcessMemory.WriteBytes`, which is the call mods use to patch
+instructions. The thread-suspension half is **not** done, and the comment at the
+call site says so: the flush does not make a patch safe against a thread already
+executing those exact bytes. That is acceptable for NoclipMod's aligned two-byte
+writes and is not acceptable for anything wider, which is the condition to check
+before widening one.
 
 ### 6.6 [S] The pattern-scan → `GetDelegateForFunctionPointer` chain is an indirect jump to a scanned address
 
@@ -1439,11 +1466,14 @@ many modules without recording which, so it enumerates again and restores any
 slot still pointing at our detour; the five Lua slots are each one known
 address.
 
-### 7.5 [Q] `log::Write` truncates silently
+### 7.5 [Q] ~~`log::Write` truncates silently~~ — RESOLVED
 
 `src/SMLoader.Shim/log.cpp:33,42` — a 1024/1200-byte buffer with `_TRUNCATE`.
 That is the right choice, but a truncated line gives no indication it was
 truncated. Append `…` when `_vsnprintf_s` returns `-1`.
+
+Applied as ASCII `...`, since the log is written as bytes and a UTF-8 ellipsis
+would be three bytes of mojibake in a file nothing declares an encoding for.
 
 ### 7.6 [P] ~~`log::Write` opens and closes the file per line~~ — RESOLVED
 

@@ -57,6 +57,16 @@ public readonly struct LuaState
     public double ToNumber(int index) => lua_tonumber(Handle, index);
     public long ToInteger(int index) => lua_tointeger(Handle, index);
 
+    /// <summary>
+    /// The value at <paramref name="index"/> as a string, or null.
+    /// </summary>
+    /// <remarks>
+    /// <b>Mutates the stack slot</b> when the value is a number: <c>lua_tolstring</c>
+    /// converts it in place. Doing that to a <em>key</em> during a
+    /// <c>lua_next</c> traversal breaks the traversal, because the next call
+    /// sees a string where it left a number. Use
+    /// <see cref="ToStringValueCopy"/> for anything you did not push yourself.
+    /// </remarks>
     public string? ToStringValue(int index)
     {
         nint ptr = lua_tolstring(Handle, index, out nuint len);
@@ -66,6 +76,22 @@ public readonly struct LuaState
         {
             return Encoding.UTF8.GetString((byte*)ptr, checked((int)len));
         }
+    }
+
+    /// <summary>
+    /// As <see cref="ToStringValue"/>, but converts a copy, so the value at
+    /// <paramref name="index"/> is left exactly as it was. Leaves the stack
+    /// balanced.
+    /// </summary>
+    public string? ToStringValueCopy(int index)
+    {
+        if (!EnsureStack(1))
+            return null;
+
+        lua_pushvalue(Handle, index);   // the copy is what gets converted
+        string? text = ToStringValue(-1);
+        Pop();
+        return text;
     }
 
     public string TypeNameOf(int index)

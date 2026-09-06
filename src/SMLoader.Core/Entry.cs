@@ -32,7 +32,12 @@ public static class Entry
     internal static event Action<LuaState>? LuaStateCreated;
 
     private static ModLoader? _modLoader;
-    private static List<string> _splash = new();
+    /// <summary>
+    /// Built on the boot thread, read on the game thread by EchoSplashToGameLog.
+    /// Published through Volatile.Write as a finished array so the reader either
+    /// sees the old one or a complete new one, never a list mid-Add.
+    /// </summary>
+    private static string[] _splash = Array.Empty<string>();
     private static int _splashEchoed;
     private static int _handlersInstalled;
     private static int _shutDown;
@@ -77,14 +82,14 @@ public static class Entry
             LuaState.ErrorSink = ex => Logging.Error("unhandled exception inside a Lua callback", ex);
             LuaState.CallCounter = Metrics.LuaCall;
 
-            _splash = Banner.Build("Mod Loader is starting", new[]
+            List<string> splash = Banner.Build("Mod Loader is starting", new[]
             {
                 new KeyValuePair<string, string>("version", Version),
                 new KeyValuePair<string, string>("runtime", ".NET " + Environment.Version),
                 new KeyValuePair<string, string>("process", $"pid {Environment.ProcessId}"),
                 new KeyValuePair<string, string>("root", root),
             });
-            foreach (string line in _splash)
+            foreach (string line in splash)
                 Logging.Write(line);
 
             _modLoader = new ModLoader(root);
@@ -107,7 +112,12 @@ public static class Entry
             });
             foreach (string line in ready)
                 Logging.Write(line);
-            _splash.AddRange(ready);
+
+            splash.AddRange(ready);
+
+            // One publication of a finished array. The game thread reads this in
+            // EchoSplashToGameLog, and must never see a list mid-Add.
+            Volatile.Write(ref _splash, splash.ToArray());
 
             // Installed last so that any lua_State the shim queued while the CLR
             // was starting is replayed after the mods have subscribed.
@@ -376,6 +386,8 @@ public static class Entry
     [ThreadStatic]
     private static bool _resolvingAsset;
 
+    private static long _fileOpenFailures;
+
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static unsafe int OnFileOpen(nint pathPtr, nint outPtr, int outChars)
     {
@@ -405,8 +417,15 @@ public static class Entry
             ((char*)outPtr)[replacement.Length] = '\0';
             return 1;
         }
-        catch
+        catch (Exception ex)
         {
+            // Returning 0 is the right policy - the engine reads its own file -
+            // but a bare catch on the hottest managed path makes a *persistent*
+            // failure invisible. Loud once, then rarely.
+            long failures = Interlocked.Increment(ref _fileOpenFailures);
+            if (failures == 1 || failures % 1000 == 0)
+                Logging.Error($"asset resolution has failed {failures} time(s)", ex);
+
             return 0;
         }
         finally
@@ -434,7 +453,7 @@ public static class Entry
         chunk.AppendLine("local sink = (sm and sm.log and sm.log.info) or print");
         chunk.AppendLine("if not sink then return 'no sink' end");
 
-        foreach (string line in _splash)
+        foreach (string line in Volatile.Read(ref _splash))
             chunk.AppendLine($"sink([[{line}]])");
 
         // DoString runs under lua_pcall, so a missing sm.log cannot fault the VM.

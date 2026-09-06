@@ -55,8 +55,16 @@ void Write(const char* fmt, ...)
     char body[1024];
     va_list args;
     va_start(args, fmt);
-    _vsnprintf_s(body, sizeof(body), _TRUNCATE, fmt, args);
+    const int bodyLength = _vsnprintf_s(body, sizeof(body), _TRUNCATE, fmt, args);
     va_end(args);
+
+    // _vsnprintf_s returns -1 when it truncated. Say so in the line rather than
+    // leaving a reader to wonder whether the message really ended there.
+    if (bodyLength < 0)
+    {
+        constexpr size_t kMark = 4;   // "..." plus the terminator
+        memcpy(body + sizeof(body) - kMark, "...", kMark);
+    }
 
     SYSTEMTIME st;
     GetLocalTime(&st);
