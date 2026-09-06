@@ -78,6 +78,25 @@ public sealed class NoclipMod : IMod
     private const int RenderMirror = 0x1C0;
     private Vector3 _renderOffset;
 
+    /// <summary>
+    /// The character _renderOffset was captured from, so it is captured once per
+    /// character rather than once per noclip toggle.
+    /// </summary>
+    /// <remarks>
+    /// This is the whole bug that made noclip degrade the more it was used. The
+    /// offset is mirror - position, and PlaceCharacter then writes position +
+    /// offset back into that same field every frame. Recapturing on the next
+    /// toggle therefore reads a value the previous session wrote, and the error
+    /// compounds. From one session's log, over four toggles:
+    ///
+    ///     mirror.z  0.000 -> -2.841 -> 25.944 -> 25.994
+    ///     offset.z -1.595 ->  6.267 -> 21.567 -> 24.099 -> 27.536
+    ///
+    /// A fresh world load appeared to "fix" it only because the field starts
+    /// near zero again.
+    /// </remarks>
+    private nint _renderOffsetFor;
+
     //   isOnGround -> movzx edx, byte [rcx+0x8E8]
     // Holding this true makes the controller treat the character as standing on
     // something, so it never integrates gravity - which is what actually stops
@@ -317,7 +336,7 @@ public sealed class NoclipMod : IMod
             if (found != 0)
             {
                 nint body = host.Memory.ReadChain(found, PositionChainFirst, PositionChainSecond);
-                if (body != 0)
+                if (body != 0 && found != _renderOffsetFor)
                 {
                     // All three components, deliberately. +0x1C0/+0x1C4 hold
                     // pointer-like values, so their offsets come out enormous
@@ -336,6 +355,7 @@ public sealed class NoclipMod : IMod
                         host.Memory.Read<float>(body + PositionOffset + 8));
 
                     _renderOffset = mirror - position;
+                    _renderOffsetFor = found;
 
                     // The raw values, not just their difference. An offset alone
                     // cannot distinguish "the mirror holds something else" from
