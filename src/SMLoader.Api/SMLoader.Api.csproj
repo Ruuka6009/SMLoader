@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>SMLoader.Api</AssemblyName>
+    <RootNamespace>SMLoader.Api</RootNamespace>
+  </PropertyGroup>
+</Project>

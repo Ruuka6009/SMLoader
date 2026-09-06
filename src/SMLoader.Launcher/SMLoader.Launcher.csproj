@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>SMLoader.Launcher</AssemblyName>
+    <RootNamespace>SMLoader.Launcher</RootNamespace>
+    <!-- -windows so Microsoft.Win32.Registry is in the framework reference set. -->
+    <TargetFramework>net10.0-windows</TargetFramework>
+  </PropertyGroup>
+</Project>

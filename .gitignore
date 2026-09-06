@@ -1,0 +1,24 @@
+bin/
+obj/
+/packages/
+riderModule.iml
+/_ReSharper.Caches/
+build/
+dist/
+*.user
+
+# IDE state
+.idea/
+.vs/
+*.suo
+*.sln.DotSettings.user
+
+# Crash dumps and diagnostic logs (these can carry machine paths,
+# environment variables and an installed-software inventory).
+hs_err_pid*.log
+replay_pid*.log
+*.hprof
+*.mdmp
+*.dmp
+core.*
+smloader.log

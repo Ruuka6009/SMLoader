@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>SMLoader.Core</AssemblyName>
+    <RootNamespace>SMLoader.Core</RootNamespace>
+    <!-- Emits SMLoader.Core.runtimeconfig.json and copies dependencies next to
+         the assembly. hostfxr needs both to boot this as a CLR component. -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SMLoader.Api\SMLoader.Api.csproj" />
+  </ItemGroup>
+</Project>

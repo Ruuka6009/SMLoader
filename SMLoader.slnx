@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SMLoader.Api/SMLoader.Api.csproj" />
+    <Project Path="src/SMLoader.Core/SMLoader.Core.csproj" />
+    <Project Path="src/SMLoader.Launcher/SMLoader.Launcher.csproj" />
+  </Folder>
+  <Folder Name="/mods/">
+    <Project Path="mods/NoclipMod/NoclipMod.csproj" />
+  </Folder>
+</Solution>
