@@ -376,7 +376,7 @@ to null or used `LuaState?`, so no call site changed — but it *is* a source-
 breaking change for any mod that did, which nothing outside this repository has
 had the chance to do yet.
 
-### 2.2 [P] Every memory read costs a `VirtualQuery`
+### 2.2 [P] ~~Every memory read costs a `VirtualQuery`~~ — RESOLVED, one of the two fixes
 
 `src/SMLoader.Core/ProcessMemory.cs:79-113`
 
@@ -408,6 +408,33 @@ public interface IMemoryRegion
     bool Write<T>(int offset, T value) where T : unmanaged;
 }
 ```
+
+**The first fix is applied. The second is deliberately not, and the reason
+matters more than the code.**
+
+`ProcessMemory` keeps eight recently-seen region descriptors per thread, newest
+first, each good for 250ms; `HasProtection` walks those instead of calling
+`VirtualQuery`. A mod hammering one object hits the first entry every time, so
+the syscall becomes a couple of compares. `[ThreadStatic]` rather than locked —
+a shared cache would put a contended cache line on the render path to save a
+syscall on it. `TryUnprotect` and `Protect` clear it, since a deliberate
+protection change is exactly the case a stale descriptor would get wrong.
+
+**What this does and does not cost.** It is easy to read the cache as trading
+safety for speed. It is not, quite. Querying immediately before dereferencing
+never made the dereference safe either — nothing holds the mapping still between
+the query and the write — so the guarantee was always "very probably still
+mapped", and the 250ms lifetime is only how much of that probability is being
+spent. The check catches a *wrong offset from a mod*, which is what it is for,
+and it goes on doing that.
+
+**Why `IMemoryRegion` was left out.** With the cache in place its remaining win
+is a handful of compares, and what it adds is a public, permanent way for a mod
+to read through a pointer that nothing is checking any more. The cheap half of
+the benefit came with the honest half of the risk; the expensive half of the
+risk bought very little. Worth revisiting only if a profile shows those compares
+mattering — and if it comes back, it should re-validate on the same 250ms stamp
+rather than being a raw pointer with a nice name.
 
 ### 2.3 [P] ~~`IsGameFocused()` makes two USER32 calls per key check~~ — RESOLVED
 
@@ -630,7 +657,7 @@ the same vector.
 `SetScriptLoadCallback` stores `free` before `load`, so a transform can never be
 handed out before the function that releases it is visible.
 
-### 2.10 [P] Managed code runs inside `CreateFileW`, on arbitrary threads
+### 2.10 [P] ~~Managed code runs inside `CreateFileW`, on arbitrary threads~~ — RESOLVED
 
 `src/SMLoader.Core/Entry.cs:243-278`
 
@@ -649,9 +676,31 @@ if (!smloader::MightMatch(fileName))
     return g_originalCreateFileW(fileName, access, share, security, disposition, flags, templateFile);
 ```
 
-Even a crude filter — "does the path contain `\Data\` and end in `.layout`,
-`.json` or `.lua`" — removes DLL loads, save files, shader caches and the
-loader's own log from the managed path entirely.
+**RESOLVED**, but not with the crude filter. Hard-coding "`\Data\` plus these
+extensions" into the shim would mean a mod registering a transform for anything
+else silently stops being called — a correctness regression bought with speed,
+and the kind that surfaces as "asset patching just doesn't work on my machine".
+
+Instead the real patterns are published down to the shim. `BootContext` gains
+`setPathFilter`, the first entry that runs **managed → native**: `AssetPatcher`
+sends its registered substrings, lowercased and newline-separated, on every
+`Register` and once more after `LoadAll`. `RedirectFileOpen` matches against them
+before touching the callback, so the filter is exactly as wide as the mods
+actually loaded.
+
+Details worth keeping:
+
+- The needle list is published as a whole vector and swapped atomically. The old
+  one is **never reclaimed** — readers are lock-free on the hottest path the shim
+  has, updates happen a handful of times at startup, and reclaiming safely would
+  need hazard pointers to recover a few dozen bytes.
+- The fold is ASCII-only, while the managed matcher is `OrdinalIgnoreCase`. A
+  needle containing anything outside ASCII therefore **disables** the filter (one
+  empty needle matches everything) rather than risk rejecting a path the managed
+  side would have matched.
+- A null needle list means "not published yet" and passes everything through; an
+  *empty* one means no mod wants any file, which is the case this pays off most —
+  the detour then stops crossing into managed code at all.
 
 ### 2.11 [P] ~~`InputScanner.FirstPressedKey` makes 247 syscalls per call~~ — RESOLVED
 
@@ -1802,8 +1851,11 @@ Next up is the performance block, starting at §2.1.
 ### Then — performance, in descending order of expected win
 
 12. ~~§2.1 `LuaState` as a struct (removes ~10 allocations per frame)~~ — done
-13. §2.2 Region-cached or handle-based memory access (removes ~4,000 syscalls/s)
-14. §2.10 Native prefilter before entering managed code on `CreateFileW`
+13. ~~§2.2 Region-cached or handle-based memory access (removes ~4,000 syscalls/s)~~ —
+    done as the region cache; the `IMemoryRegion` handle was deliberately not
+    added, see the item
+14. ~~§2.10 Native prefilter before entering managed code on `CreateFileW`~~ —
+    done, driven by the registered patterns rather than a hard-coded rule
 15. ~~§2.6 Cache patched script output by content hash~~ — done, and §2.7 / §2.8
     with it, since the change detection they share had to move off `Source`
 16. ~~§2.4 / §2.5 Cache typed settings; debounce config saves~~ — done, and §5.6
@@ -1812,6 +1864,9 @@ Next up is the performance block, starting at §2.1.
 18. ~~§2.12 `[SuppressGCTransition]` on the trivial Lua bindings~~ — done
 19. ~~§2.9 Atomics instead of mutexes for the write-once callbacks~~ — done, and
     §3.7 fell out of §2.8
+
+The performance block is done. Next is hardening and tooling, starting at item
+20.
 
 ### Then — hardening and tooling
 

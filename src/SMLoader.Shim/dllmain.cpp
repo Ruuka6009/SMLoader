@@ -34,6 +34,41 @@ std::atomic<SetFenvCallback>    g_setFenv{nullptr};
 std::atomic<FileOpenCallback>   g_fileOpen{nullptr};
 std::atomic<LuaCloseCallback>   g_closeCallback{nullptr};
 
+// Substrings the managed side wants to see, lowercased. Published as a whole
+// vector and read without a lock from every file open in the process.
+//
+// Never reclaimed. Readers are lock-free on the hottest path the shim has and
+// updates happen a handful of times at startup, so freeing the old vector
+// safely would mean hazard pointers or an epoch scheme to reclaim a few dozen
+// bytes. Deliberate, and bounded by the number of registrations.
+std::atomic<const std::vector<std::wstring>*> g_pathNeedles{nullptr};
+
+// ASCII-only fold. The managed side lowercases with ToLowerInvariant, and a
+// needle carrying anything outside ASCII disables the filter rather than risk
+// disagreeing with OrdinalIgnoreCase on the managed side - see SetPathFilter.
+inline wchar_t Fold(wchar_t c)
+{
+    return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c - L'A' + L'a') : c;
+}
+
+bool ContainsFolded(const wchar_t* haystack, const std::wstring& needle)
+{
+    // An empty needle is the "match everything" marker.
+    if (needle.empty())
+        return true;
+
+    for (const wchar_t* h = haystack; *h; ++h)
+    {
+        size_t i = 0;
+        while (i < needle.size() && h[i] && Fold(h[i]) == needle[i])
+            ++i;
+
+        if (i == needle.size())
+            return true;
+    }
+    return false;
+}
+
 } // namespace
 
 const wchar_t* RootDir()
@@ -156,6 +191,44 @@ void SeedScriptEnvironment(void* L)
         callback(L);
 }
 
+void SetPathFilter(const wchar_t* needles)
+{
+    auto* built = new std::vector<std::wstring>();
+    bool nonAscii = false;
+
+    if (needles)
+    {
+        const wchar_t* start = needles;
+        for (const wchar_t* p = needles; ; ++p)
+        {
+            if (*p > 0x7F)
+                nonAscii = true;
+
+            if (*p == L'\n' || *p == L'\0')
+            {
+                if (p > start)
+                    built->emplace_back(start, static_cast<size_t>(p - start));
+                if (*p == L'\0')
+                    break;
+                start = p + 1;
+            }
+        }
+    }
+
+    if (nonAscii)
+    {
+        // Our fold is ASCII-only and the managed matcher is OrdinalIgnoreCase.
+        // Rather than risk filtering out a path the managed side would have
+        // matched, hand it everything: one empty needle matches all.
+        built->clear();
+        built->emplace_back();
+        SMLOG("path filter: non-ASCII needle, filtering disabled");
+    }
+
+    g_pathNeedles.store(built, std::memory_order_release);
+    SMLOG("path filter published: %zu needle(s)", built->size());
+}
+
 void SetFileOpenCallback(FileOpenCallback cb)
 {
     g_fileOpen.store(cb, std::memory_order_release);
@@ -167,6 +240,27 @@ bool RedirectFileOpen(const wchar_t* path, wchar_t* out, int outChars)
     FileOpenCallback callback = g_fileOpen.load(std::memory_order_acquire);
     if (!callback || !path)
         return false;
+
+    // Answer here rather than in managed code wherever we can. This runs on
+    // whichever thread opened the file, including engine workers that have
+    // never run managed code - so every crossing risks a CLR thread attach,
+    // allocates a string, and can therefore trigger a GC inside a file open.
+    // DLL loads, save files, shader caches and our own log never get that far.
+    if (const auto* needles = g_pathNeedles.load(std::memory_order_acquire))
+    {
+        bool wanted = false;
+        for (const auto& needle : *needles)
+        {
+            if (ContainsFolded(path, needle))
+            {
+                wanted = true;
+                break;
+            }
+        }
+
+        if (!wanted)
+            return false;
+    }
 
     return callback(path, out, outChars) != 0;
 }

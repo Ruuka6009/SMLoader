@@ -44,6 +44,10 @@ struct BootContext {
     // Appended after 0.1.0. Guarded by `size` on the managed side, which is
     // what that field has always been for.
     void (__cdecl* setLuaCloseCallback)(LuaCloseCallback cb);
+
+    // Managed -> native, unlike everything above it. Publishes the substrings
+    // mods have registered so the CreateFileW detour can answer for itself.
+    void (__cdecl* setPathFilter)(const wchar_t* needles);
 };
 
 extern HMODULE g_selfModule;
@@ -81,6 +85,11 @@ void SetFileOpenCallback(FileOpenCallback cb);
 // Called by the CreateFileW detour. Returns true when `out` holds a
 // replacement path for the file being opened.
 bool RedirectFileOpen(const wchar_t* path, wchar_t* out, int outChars);
+
+// Installed by the managed side. `needles` is a single newline-separated,
+// already-lowercased string of the substrings mods want to match; an empty
+// string means nobody wants anything. Copied immediately.
+void SetPathFilter(const wchar_t* needles);
 
 // How many lua_States the detour has observed so far.
 int SeenStateCount();

@@ -25,6 +25,7 @@ public static class Entry
         public nint SetSetFenvCallback;    // void (*)(void (*)(void* L))
         public nint SetFileOpenCallback;   // void (*)(int (*)(const wchar_t*, wchar_t*, int))
         public nint SetLuaCloseCallback;   // void (*)(void (*)(void* L)) - added after 0.1.0
+        public nint SetPathFilter;         // void (*)(const wchar_t* needles) - added after 0.1.0
     }
 
     /// <summary>Raised on the game's thread for every lua_State it creates.</summary>
@@ -34,6 +35,12 @@ public static class Entry
     private static List<string> _splash = new();
     private static int _splashEchoed;
     private static int _handlersInstalled;
+
+    /// <summary>
+    /// Native entry that receives the substrings mods want to match, so the
+    /// CreateFileW detour can reject a path without entering managed code.
+    /// </summary>
+    private static unsafe delegate* unmanaged[Cdecl]<nint, void> _setPathFilter;
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     public static unsafe int Boot(nint contextPtr)
@@ -54,6 +61,11 @@ public static class Entry
 
             Logging.Initialize(root);
             AssetPatcher.Initialize(root);
+
+            // Captured before mods load, so a registration made during LoadAll
+            // publishes its needle straight away.
+            if (context.Size >= sizeof(BootContext) && context.SetPathFilter != 0)
+                _setPathFilter = (delegate* unmanaged[Cdecl]<nint, void>)context.SetPathFilter;
             SettingsPanel.Install();
             LuaState.ErrorSink = ex => Logging.Error("unhandled exception inside a Lua callback", ex);
 
@@ -72,6 +84,10 @@ public static class Entry
 
             // After mods have declared their settings, so the panel sees them.
             SettingsRegistry.PublishToLua();
+
+            // Publish even with no registrations: an empty needle list is how the
+            // shim learns it can stop calling us entirely.
+            AssetPatcher.PublishPathFilter();
 
             List<string> ready = Banner.Build("Ready", new[]
             {
@@ -143,6 +159,22 @@ public static class Entry
             Logging.Error("unobserved task exception", e.Exception);
             e.SetObserved();
         };
+    }
+
+    /// <summary>
+    /// Hands the shim the newline-separated, lowercased substrings to match.
+    /// An empty string means no mod wants any file, which is the case the
+    /// filter pays off most: the detour stops crossing into managed code at all.
+    /// </summary>
+    internal static unsafe void PublishPathFilter(string needles)
+    {
+        delegate* unmanaged[Cdecl]<nint, void> publish = _setPathFilter;
+        if (publish == null)
+            return;
+
+        // The shim copies the string before returning.
+        fixed (char* p = needles)
+            publish((nint)p);
     }
 
     private static string DescribeMods()

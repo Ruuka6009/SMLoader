@@ -224,6 +224,7 @@ bool Start()
     context.setSetFenvCallback   = &SetSetFenvCallback;
     context.setFileOpenCallback  = &SetFileOpenCallback;
     context.setLuaCloseCallback  = &SetLuaCloseCallback;
+    context.setPathFilter        = &SetPathFilter;
 
     SMLOG("calling managed Boot");
     const int bootResult = boot(&context);

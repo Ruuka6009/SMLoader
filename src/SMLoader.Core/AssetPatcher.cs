@@ -51,7 +51,24 @@ internal static class AssetPatcher
             Resolved.Clear(); // a new rule may match paths already judged a miss
         }
 
+        PublishPathFilter();
         Logging.Write($"[{modName}] will patch assets matching '{pathContains}'");
+    }
+
+    /// <summary>
+    /// Tells the shim which substrings are worth waking managed code for. The
+    /// native detour rejects everything else without a CLR transition, which is
+    /// most of what a game process opens.
+    /// </summary>
+    public static void PublishPathFilter()
+    {
+        string needles;
+        lock (Gate)
+        {
+            needles = string.Join('\n', Registrations.Select(r => r.PathContains.ToLowerInvariant()));
+        }
+
+        Entry.PublishPathFilter(needles);
     }
 
     /// <summary>
