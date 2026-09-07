@@ -26,6 +26,7 @@ public static class Entry
         public nint SetFileOpenCallback;   // void (*)(int (*)(const wchar_t*, wchar_t*, int))
         public nint SetLuaCloseCallback;   // void (*)(void (*)(void* L)) - added after 0.1.0
         public nint SetPathFilter;         // void (*)(const wchar_t* needles) - added after 0.1.0
+        public nint NativePluginReport;    // const wchar_t* - added after 0.1.0
     }
 
     /// <summary>Raised on the game's thread for every lua_State it creates.</summary>
@@ -78,6 +79,14 @@ public static class Entry
             // publishes its needle straight away.
             if (context.Size >= sizeof(BootContext) && context.SetPathFilter != 0)
                 _setPathFilter = (delegate* unmanaged[Cdecl]<nint, void>)context.SetPathFilter;
+
+            // Nothing to load here - the shim mapped these before the CLR
+            // existed, because a graphics plugin has to hook the renderer
+            // before the engine creates its device. All that is left is to say
+            // what happened, in the splash and in the log.
+            if (context.Size >= sizeof(BootContext) && context.NativePluginReport != 0)
+                NativePlugins.Initialize(Marshal.PtrToStringUni(context.NativePluginReport));
+
             SettingsPanel.Install();
             LuaState.ErrorSink = ex => Logging.Error("unhandled exception inside a Lua callback", ex);
             LuaState.CallCounter = Metrics.LuaCall;
@@ -105,11 +114,19 @@ public static class Entry
             _statsTimer = new Timer(_ => Logging.Debug(Metrics.Report()), null,
                                     TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
 
-            List<string> ready = Banner.Build("Ready", new[]
+            var readyFacts = new List<KeyValuePair<string, string>>
             {
-                new KeyValuePair<string, string>("mods", DescribeMods()),
-                new KeyValuePair<string, string>("waiting", "for the game's Lua VM"),
-            });
+                new("mods", DescribeMods()),
+            };
+
+            // Only when there are any: a "plugins  none" row on every launch is
+            // noise for the players who will never use one.
+            if (NativePlugins.Describe() is { } plugins)
+                readyFacts.Add(new KeyValuePair<string, string>("plugins", plugins));
+
+            readyFacts.Add(new KeyValuePair<string, string>("waiting", "for the game's Lua VM"));
+
+            List<string> ready = Banner.Build("Ready", readyFacts);
             foreach (string line in ready)
                 Logging.Write(line);
 

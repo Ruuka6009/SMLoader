@@ -2,6 +2,7 @@
 #include "iat_hook.h"
 #include "clr_host.h"
 #include "log.h"
+#include "native_plugins.h"
 
 #include <atomic>
 #include <mutex>
@@ -323,6 +324,12 @@ VOID CALLBACK StatusTick(PVOID, BOOLEAN)
     ReportStatus(elapsed);
 }
 
+DWORD WINAPI PluginThread(LPVOID)
+{
+    smloader::plugins::LoadAll();
+    return 0;
+}
+
 DWORD WINAPI BootThread(LPVOID)
 {
     // The Windows loader finishes resolving the exe's imports after our
@@ -420,6 +427,24 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
     SMLOG("SMLoader shim attached to pid %lu", GetCurrentProcessId());
 
     smloader::iat::InstallLuaHooks();
+
+    // Started before the boot thread, and not on it, because the two have
+    // opposite deadlines. A graphics plugin must be mapped before the engine
+    // creates its device, which can happen within a few hundred milliseconds;
+    // the boot thread spends its first second re-taking the IAT slot and then
+    // starts CoreCLR. Neither should be waiting on the other. LoadLibraryW is
+    // also not something to do under the loader lock, which is why it is a
+    // thread at all.
+    HANDLE plugins = CreateThread(nullptr, 0, PluginThread, nullptr, 0, nullptr);
+    if (plugins)
+    {
+        CloseHandle(plugins);
+    }
+    else
+    {
+        SMLOG("FAILED: CreateThread for native plugins, error %lu", GetLastError());
+        smloader::plugins::Cancel();
+    }
 
     // CoreCLR must not be started under the loader lock.
     HANDLE thread = CreateThread(nullptr, 0, BootThread, nullptr, 0, nullptr);

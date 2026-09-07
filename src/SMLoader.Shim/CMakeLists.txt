@@ -9,6 +9,7 @@ add_library(SMLoader.Shim SHARED
     iat_hook.cpp
     clr_host.cpp
     log.cpp
+    native_plugins.cpp
 )
 
 set_target_properties(SMLoader.Shim PROPERTIES

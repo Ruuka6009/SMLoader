@@ -7,6 +7,7 @@ string? distPath = null;
 bool noMods = false;
 bool allowExternalDist = false;
 bool anyMod = false;
+bool reshade = false;
 var passThrough = new List<string>();
 
 for (int i = 0; i < args.Length; i++)
@@ -27,6 +28,9 @@ for (int i = 0; i < args.Length; i++)
             break;
         case "--any-mod":
             anyMod = true;
+            break;
+        case "--reshade":
+            reshade = true;
             break;
         case "--help" or "-h":
             PrintUsage();
@@ -98,6 +102,17 @@ Console.WriteLine($"Loader: {distPath}");
 if (noMods)
     Console.WriteLine("Mods  : disabled (--no-mods)");
 
+// Before the game starts, because the shim maps these the moment it attaches -
+// a renderer hook is no use once the renderer exists. Off unless asked for:
+// launching normally must give the player the game they had before.
+//
+// Deliberately not gated on --no-mods. Passing both is how you get ReShade with
+// no managed mods behind it, which is the launch that tells you which of the two
+// a problem belongs to.
+NativePlugins.Publish(Path.Combine(distPath, "Mods"),
+                      enabled: reshade,
+                      ignoreAllowList: anyMod);
+
 try
 {
     Injector.LaunchWithShim(gamePath, shimPath, string.Join(' ', passThrough));
@@ -123,6 +138,10 @@ static void PrintUsage()
           --no-mods               Safe mode: boot the loader with no mods at all,
                                   to tell a loader problem from a mod problem
           --any-mod               Ignore Mods/allowed.json and load every mod found
+          --reshade               Also load the native plugins under Mods/, such as
+                                  ReShade. Off by default: they hook the renderer,
+                                  so a normal launch leaves the game untouched.
+                                  Combine with --no-mods for ReShade on its own
           --help                  Show this text
 
         Any other arguments are forwarded to the game, e.g. -dev.

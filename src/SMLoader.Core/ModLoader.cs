@@ -1,7 +1,5 @@
 using System.Reflection;
 using System.Runtime.Loader;
-using System.Security.Cryptography;
-using System.Text.Json;
 using SMLoader.Api;
 
 namespace SMLoader.Core;
@@ -14,8 +12,8 @@ internal sealed class ModLoader
     private readonly string _root;
     private readonly List<IMod> _loaded = new();
 
-    /// <summary>File name -> expected SHA-256, or null when no allowlist is in force.</summary>
-    private Dictionary<string, string>? _allowed;
+    /// <summary>The SHA-256 allowlist, or null when none is in force.</summary>
+    private ModAllowList? _allowed;
 
     /// <summary>Names already taken, so a duplicate is caught rather than shadowing.</summary>
     private readonly HashSet<string> _names = new(StringComparer.OrdinalIgnoreCase);
@@ -83,21 +81,18 @@ internal sealed class ModLoader
             return;
         }
 
-        string path = Path.Combine(modsDirectory, "allowed.json");
-        if (!File.Exists(path))
-            return;
+        _allowed = ModAllowList.Load(modsDirectory, out string? failure);
 
-        try
-        {
-            _allowed = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(path));
-            Logging.Write($"allowlist active: {_allowed?.Count ?? 0} entr(ies) from {path}");
-        }
-        catch (Exception ex)
+        if (failure is not null)
         {
             // Refuse everything rather than silently degrading to "load anything":
             // a corrupt allowlist must not be a way past the allowlist.
-            _allowed = new Dictionary<string, string>();
-            Logging.Error($"could not read {path}; no mod will be allowed to load", ex);
+            Logging.Error($"{failure}; no mod will be allowed to load");
+        }
+        else if (_allowed is not null)
+        {
+            Logging.Write($"allowlist active: {_allowed.Count} entr(ies) from " +
+                          ModAllowList.PathFor(modsDirectory));
         }
     }
 
@@ -107,39 +102,26 @@ internal sealed class ModLoader
     /// </summary>
     private bool IsAllowed(string assemblyPath)
     {
-        if (_allowed is null)
+        if (_allowed is null || _allowed.IsAllowed(assemblyPath, out string reason))
             return true;
 
-        string name = Path.GetFileName(assemblyPath);
-        if (!_allowed.TryGetValue(name, out string? expected))
-        {
-            Logging.Error($"{name} is not in the allowlist; not loading it");
-            return false;
-        }
-
-        string actual;
-        try
-        {
-            using FileStream stream = File.OpenRead(assemblyPath);
-            actual = Convert.ToHexString(SHA256.HashData(stream));
-        }
-        catch (Exception ex)
-        {
-            Logging.Error($"could not hash {assemblyPath}; not loading it", ex);
-            return false;
-        }
-
-        if (string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        Logging.Error($"{name} does not match the allowlist (expected {expected}, " +
-                      $"found {actual}); not loading it");
+        Logging.Error($"{reason}; not loading it");
         return false;
     }
 
     private void LoadFrom(string directory)
     {
         string name = Path.GetFileName(directory);
+
+        // Native plugins - ReShade and the like - were mapped by the shim long
+        // before this ran. Reading a 5 MB DLL just to fail on it would be the
+        // only thing that happened here.
+        if (NativePlugins.OwnsDirectory(directory))
+        {
+            Logging.Debug($"{name}: native plugin, already loaded by the shim");
+            return;
+        }
+
         string assemblyPath = Path.Combine(directory, name + ".dll");
 
         if (!File.Exists(assemblyPath))
@@ -173,6 +155,16 @@ internal sealed class ModLoader
                 return;
 
             types = GetLoadableTypes(assembly, name);
+        }
+        catch (BadImageFormatException)
+        {
+            // A native DLL in a mod folder. Reachable when the launcher did not
+            // publish it - no --reshade, or the allowlist refused it - so say
+            // which, rather than reporting it as a broken mod.
+            Logging.Write($"{name}: {Path.GetFileName(assemblyPath)} is native code rather than " +
+                          "a .NET assembly. Native plugins are loaded by the launcher; pass " +
+                          "--reshade to enable them.");
+            return;
         }
         catch (Exception ex)
         {

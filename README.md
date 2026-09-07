@@ -15,7 +15,7 @@ added, so *Verify integrity of game files* has nothing to undo.
 
 That follows from what a mod loader is, rather than being a gap to close
 later - see [SECURITY.md](SECURITY.md), which also covers the mod allowlist,
-the `--no-mods` safe mode, and multiplayer and anti-cheat.
+the `--no-mods` safe mode, opt-in native plugins, and multiplayer and anti-cheat.
 
 ## How it works
 
@@ -25,12 +25,14 @@ SMLoader.Launcher.exe
       |
 SMLoader.Shim.dll  (C++)
   1. hooks the exe's IAT entry for lua51.dll!luaL_newstate
-  2. starts CoreCLR through hostfxr on a worker thread
+  2. maps the native plugins the launcher approved, on a thread of its own
+  3. starts CoreCLR through hostfxr on a worker thread
       |
 SMLoader.Core.dll  (C#)
   loads mods from Mods/, forwards every lua_State to them
       |
 Mods/<Name>/<Name>.dll  (C#, implements IMod)
+Mods/<Name>/<Name>.dll  (native, e.g. ReShade - see --reshade below)
 ```
 
 The important part is that the game ships **lua51.dll** (LuaJIT) as a separate
@@ -134,6 +136,114 @@ Not at the main menu. On a normal boot the log looks like this:
 
 `lua_States seen 0` at the menu is normal, not a failure - the `status at Ns`
 checkpoints exist precisely to distinguish that from a lost hook.
+
+## ReShade and other native plugins
+
+A mod folder can hold native code instead of a .NET assembly. Drop a ReShade
+build into `dist/Mods/ReShade/` and launch with `--reshade`:
+
+```
+dist/Mods/ReShade/
+  dxgi.dll            the ReShade DLL, whatever it happens to be named
+  ReShade.ini         ReShade's own config, written here rather than in the game folder
+  reshade-shaders/    Shaders/ and Textures/
+  *.addon64           add-ons, loaded by ReShade itself
+```
+
+```powershell
+.\dist\SMLoader.Launcher.exe --reshade -dev
+```
+
+```
+Game  : D:\SteamLibrary\steamapps\common\Scrap Mechanic\Release\ScrapMechanic.exe
+Loader: C:\Dev\SMLoader\dist
+Native: ReShade keeps its config, shaders, presets and screenshots in C:\Dev\SMLoader\dist\Mods\ReShade
+Native: ReShade 6.8.0 (+19 add-ons) - C:\Dev\SMLoader\dist\Mods\ReShade\dxgi.dll
+```
+
+and the Ready banner names it next to the mods:
+
+```
+##############################################################
+#                                                            #
+#  S M L O A D E R                                           #
+#  Ready                                                     #
+#                                                            #
+#    mods      1 - NoclipMod 1.0.0                           #
+#    plugins   ReShade 6.8.0 (+19 add-ons)                   #
+#    waiting   for the game's Lua VM                         #
+#                                                            #
+##############################################################
+```
+
+Without `--reshade` the plugin is found and left alone, and the launcher says
+so, so a folder that does nothing is never silent:
+
+```
+Native: ReShade 6.8.0 (+19 add-ons) found, not enabled (pass --reshade)
+```
+
+### Why it is opt-in
+
+A native plugin is not a mod the loader controls. It hooks the graphics API,
+it stays for the session, and nothing in SMLoader can unload it or contain it.
+Launching normally therefore has to give the player the game they had before,
+which means the renderer is only touched when someone asks for it in as many
+words.
+
+`--reshade` and `--no-mods` are independent, and combining them is the point:
+
+```powershell
+.\dist\SMLoader.Launcher.exe --reshade --no-mods
+```
+
+is ReShade with nothing behind it, which is the launch that says whether a
+problem belongs to the plugin or to the loader. Both are off by default, so it
+still takes two flags to get there.
+
+### Nothing lands in the Steam folder
+
+The usual ReShade install puts `dxgi.dll` next to `ScrapMechanic.exe` and lets
+it scatter `ReShade.ini`, `ReShade.log`, `reshade-shaders/` and every
+screenshot through the game directory - exactly what SMLoader exists not to do.
+
+Instead the launcher points `RESHADE_BASE_PATH_OVERRIDE` at the mod folder
+before the game starts, so ReShade resolves its config, log, shader and texture
+search paths, presets and screenshots inside `Mods/ReShade/`. Deleting that one
+folder undoes all of it, and *Verify integrity of game files* still has nothing
+to find. If you set that variable yourself, SMLoader leaves it alone.
+
+### Which DLL in the folder is the plugin
+
+In order: the one named after the folder (`Mods/ReShade/ReShade.dll`), the only
+DLL in the folder, or the one whose version resource names the folder - which
+is how `dxgi.dll` is recognised in a folder called `ReShade` even with a
+`d3dcompiler_47.dll` beside it. Several DLLs and no way to choose is reported
+rather than guessed at, with the rename to make.
+
+Managed mods are never picked up this way: the launcher reads the PE header, so
+a .NET assembly stays SMLoader.Core's business and a 32-bit DLL is refused with
+a reason instead of a Windows error code.
+
+### When it is loaded
+
+The shim maps native plugins on a thread of its own the moment it attaches -
+before the game's main thread has run an instruction, and a full second before
+CoreCLR is up. A renderer hook is worth nothing once the renderer exists, which
+is why this does not wait behind the managed side, and why the managed side is
+handed the *result* rather than the job.
+
+One failure is worth knowing about: if the plugin is called `dxgi.dll` and
+something has already mapped a `dxgi.dll` under that name, the Windows loader
+can hand back that module instead of yours, and the plugin never runs while
+everything looks fine. SMLoader compares what it got against what it asked for
+and reports the mismatch rather than a load that did nothing. Renaming the file
+to `ReShade64.dll` avoids the question.
+
+### Multiplayer
+
+`--reshade` is post-processing, not a game change - but it is still an injected
+DLL in the process, so the caveat at the bottom of this file applies unchanged.
 
 ## Changing game behaviour without touching game files
 

@@ -1,6 +1,7 @@
 #include "clr_host.h"
 #include "shim.h"
 #include "log.h"
+#include "native_plugins.h"
 
 #include <string>
 #include <vector>
@@ -225,6 +226,10 @@ bool Start()
     context.setFileOpenCallback  = &SetFileOpenCallback;
     context.setLuaCloseCallback  = &SetLuaCloseCallback;
     context.setPathFilter        = &SetPathFilter;
+
+    // Blocks until the plugin thread is done, so the splash describes a
+    // finished result rather than one still in flight.
+    context.nativePlugins        = plugins::Report();
 
     SMLOG("calling managed Boot");
     const int bootResult = boot(&context);

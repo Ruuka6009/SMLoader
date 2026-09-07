@@ -48,6 +48,12 @@ struct BootContext {
     // Managed -> native, unlike everything above it. Publishes the substrings
     // mods have registered so the CreateFileW detour can answer for itself.
     void (__cdecl* setPathFilter)(const wchar_t* needles);
+
+    // Newline-separated "<status>|<path>" lines, one per native plugin the
+    // launcher asked the shim to map before the CLR existed. Data rather than a
+    // callback, because by the time managed code runs the loading has already
+    // happened and all that is left is reporting it.
+    const wchar_t* nativePlugins;
 };
 
 extern HMODULE g_selfModule;

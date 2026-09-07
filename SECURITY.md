@@ -35,6 +35,27 @@ and would leave something that could no longer load a mod like NoclipMod.
   allowlist. `--any-mod` skips it for one launch.
 - **Provides a safe mode.** `--no-mods` boots the loader with no mods at all, so
   you can tell a loader problem from a mod problem in one launch.
+- **Keeps native plugins opt-in.** A mod folder holding native code rather than a
+  .NET assembly - ReShade is the case this exists for - is found but not loaded
+  unless you pass `--reshade`. Such a plugin is mapped into the process before
+  the CLR exists and hooks the graphics API from its own `DllMain`; the loader
+  cannot unload it, contain it or see what it does. Launching normally therefore
+  runs the game unchanged. `--reshade` and `--no-mods` are independent - passing
+  both gives ReShade with no managed mods behind it, which is how you tell the
+  two apart when something breaks.
+- **Checks native plugins against the same allowlist.** `Mods/allowed.json`
+  covers them too. The check runs in the launcher, before the game process
+  exists, because that is the last moment anything managed can look at the file
+  - and a plugin that loads earlier and with fewer questions asked than any mod
+  is the last thing that should get to skip it.
+
+  The list the launcher hands the shim travels in the `SMLOADER_NATIVE_PLUGINS`
+  environment variable, and the launcher clears anything it inherited first, so
+  a value left in a shell does not get to decide what runs inside the game. When
+  nothing is to be loaded it also sets `SMLOADER_NO_NATIVE=1`, and the shim
+  refuses on that alone - the same decision stated twice, so the variable
+  carrying the paths is never the only thing standing between a stale
+  environment and a DLL being mapped.
 
 ## Multiplayer and anti-cheat
 

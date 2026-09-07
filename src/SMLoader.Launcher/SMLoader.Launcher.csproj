@@ -6,4 +6,16 @@
     <!-- -windows so Microsoft.Win32.Registry is in the framework reference set. -->
     <TargetFramework>net10.0-windows</TargetFramework>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      Linked, not referenced. The launcher has to decide what the shim may load
+      before the game process exists, and SMLoader.Core only exists inside it -
+      but the rules ("is this a .NET assembly", "is this hash allowed") must be
+      the same on both sides, and two copies of a security check are one copy
+      too many. Both files are deliberately free of anything in-process.
+    -->
+    <Compile Include="..\SMLoader.Core\ModAllowList.cs" Link="Shared\ModAllowList.cs" />
+    <Compile Include="..\SMLoader.Core\NativePluginScan.cs" Link="Shared\NativePluginScan.cs" />
+  </ItemGroup>
 </Project>
