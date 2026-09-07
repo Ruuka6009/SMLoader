@@ -9,5 +9,6 @@
   </Folder>
   <Folder Name="/mods/">
     <Project Path="mods/NoclipMod/NoclipMod.csproj" />
+    <Project Path="mods/PhysgunMod/PhysgunMod.csproj" />
   </Folder>
 </Solution>

@@ -53,6 +53,7 @@ not.
 | `src/SMLoader.Core` | C# lib | boot entry, mod discovery, logging |
 | `src/SMLoader.Launcher` | C# exe | finds the game, injects the shim |
 | `mods/NoclipMod` | C# lib | sample mod |
+| `mods/PhysgunMod` | C# lib | physics gun for creative mode |
 
 ## Build
 
@@ -244,6 +245,182 @@ to `ReShade64.dll` avoids the question.
 
 `--reshade` is post-processing, not a game change - but it is still an injected
 DLL in the process, so the caveat at the bottom of this file applies unchanged.
+
+## Physgun
+
+A Garry's Mod style physics gun for creative mode, built entirely on the game's
+own scripting API - `sm.physics.applyImpulse` for the hold, a raycast for the
+aim, a `ShapeRenderable` effect for the beam. No game file is touched.
+
+It is **off until you turn it on**, because the grab key defaults to left mouse
+and creative mode already has a use for that.
+
+| | Default | |
+|---|---|---|
+| Physgun mode | `G` or `/physgun` | off at launch |
+| Grab | left mouse | hold to carry what you are looking at |
+| Freeze | right mouse | while carrying: pins it where it is and lets go |
+| Unfreeze | `R` | releases the frozen object you are looking at |
+| Push / pull | `PageUp` / `PageDown` | move the carried object further or nearer |
+
+`/physgunrange <m>`, `/physgunforce <n>`, `/unfreezeall`, `/physgundebug` and
+`/physgunstatus` round it out, and every key and constant is also a row in the
+shared settings panel.
+
+### It carries creations, not blocks
+
+The ray resolves to a body, and the body to `getCreationBodies()` - the whole
+welded, bearinged, pistoned thing. The spring then drives the creation's
+*mass-weighted centre of mass*, and hands each body its share of the velocity
+change in proportion to its own mass.
+
+Both halves of that matter, and getting either wrong makes the physgun pull in
+some directions and not others:
+
+- Towing one body of a jointed contraption sends the force through its bearings,
+  and a joint only transmits along the axes it does not constrain - so the
+  directions that worked were the ones the joints left free.
+- `body.worldPosition` is the body's *origin*, which can sit metres from its
+  centre of mass, while an impulse always acts at the centre of mass. Driving
+  the origin to the target leaves a lever arm that rotates with the object,
+  biasing the pull in a direction that turns as the object turns.
+
+A ray that lands on a bearing or piston reports type `"joint"` rather than
+`"body"` and carries no shape of its own; it is resolved through the joint's
+`shapeA`, the way `Lift.lua` does it. On most builds the moving parts are most
+of what you can actually point at.
+
+### Why it is a spring, not a teleport
+
+Scrap Mechanic binds no `setWorldPosition` or `setVelocity` on a `Body` - in the
+game's own scripts those methods appear only on characters, triggers and
+effects. The only way to move a body is to push it, so the hold is a damped
+spring evaluated on the server's fixed tick:
+
+```lua
+local dv = offset * ( stiffness * dt )
+         - body.velocity * ( damping * dt )
+         + sm.vec3.new( 0, 0, tuning.gravity * dt )   -- cancel this tick's fall
+
+sm.physics.applyImpulse( body, dv * body.mass, true )
+```
+
+That constraint is also what makes it feel right. The gravity term is what stops
+a carried object sagging until the spring error is large enough to hold its own
+weight, and `stiffness` is capped because the spring is integrated once per
+40 Hz tick - `k*dt` much above 1.5 overshoots further every tick.
+
+It runs on the **server** half of the player script for the same reason noclip
+does: the server owns body positions, and a client that moves things itself is
+racing the physics it is trying to steer. The client sends only where it is
+aiming.
+
+### Spin damping is a loop over an inertia nothing exposes
+
+Settling a carried object's tumble means feeding its angular velocity back as an
+opposing angular impulse. Angular impulse is inertia times a change in spin, and
+Scrap Mechanic binds no inertia anywhere - not on `Body`, not on `Shape`, not
+under any name in the executable.
+
+Scaling by mass instead, the way the game's own one-shot tumbles do
+(`PlasmaDrill.lua:489`), makes that a controller whose gain is wrong by whatever
+the ratio of mass to inertia happens to be. For a single block, mass
+over-estimates inertia by roughly ten, so each correction overshoots, the spin
+reverses larger every tick, and after a few seconds of carrying, the object is
+spinning hard enough to fling itself off anything it touches. A one-shot impulse
+never showed this because a one-shot closes no loop.
+
+The impulse is therefore scaled by a *lower bound* on inertia: every shape is at
+least one 0.25 m block, so inertia is at least `mass * 0.01`. The change in spin
+actually applied is then `(bound / true inertia) * fraction * spin`, which can
+never exceed the spin itself - so the loop cannot overshoot whatever it is
+holding. Large creations settle more slowly than they could; that is what not
+knowing inertia costs, and it is the right side to err on.
+
+### Freeze pins, it does not spring
+
+Nothing in the Lua API makes a dynamic body static. `sm.player.placeLift` is the
+only true immobiliser, and it snaps the build to a quarter-metre grid under a
+visible lift - not a freeze where you left it.
+
+So freeze pins every body of the creation to its own centre of mass at the
+moment you let go, and each tick steps it back towards that point while
+cancelling whatever velocity it has picked up:
+
+```lua
+local dv = offset * ( PG_PIN_GAIN / dt )
+         - body.velocity * PG_PIN_VELOCITY_CANCEL
+         + pose.bias                                  -- learned, see below
+```
+
+A spring answers a shove with a restoring force, so the build absorbs the energy
+and bobs; the pin cancels the velocity instead, so there is far less left to bob
+with. Simulated against a 5 m/s shove, it is back within 5 mm in **250 ms**.
+
+Proportional control alone cannot hold a body against a *steady* force: it
+settles wherever its correction happens to balance that force, and that offset
+is what you see as a frozen build sitting slightly off and drifting. The steady
+force here is whatever the gravity feed-forward gets wrong - and the game reports
+its real gravity nowhere, so rather than guess it, the pin integrates its own
+error and learns it. Against a residual as large as 10 m/s^2 that takes the
+settled error from about **25 mm to under 0.1 mm**.
+
+Pinning each body separately is also what stops a contraption folding at its own
+joints while frozen.
+
+### Every correction here is closed over a stale reading
+
+`PG_PIN_GAIN` is a quarter and not one, and that is the whole difference between
+a frozen build sitting still and a frozen build flying across the map.
+
+The script sees the solver's state as it was at the *start* of the step, not as
+it is when the impulse lands. With that one tick of latency, a loop removing a
+fraction `g` of its error per tick is no longer the textbook
+`x[n+1] = (1-g)*x[n]`, stable for any `g < 2`. It is:
+
+```
+x[n+1] = x[n] - g*x[n-1]      ->   z^2 - z + g = 0,   |z| = sqrt(g)
+```
+
+so the real limit is `g < 1`, and `g = 1` sits exactly on the unit circle -
+ringing forever instead of settling, with the joint solver more than enough to
+push it over. Closing the whole gap in one tick is precisely that `g = 1`.
+
+Every gain in the mod is picked against this limit, and the spin fractions are
+capped for the same reason - the spin damping slider's own maximum was otherwise
+enough to make a *carried* object diverge. Simulated with latency, on the
+thinnest shape in the game:
+
+Cancelling *all* of a pinned body's velocity is a second way to sit on that
+limit, and a less obvious one: the velocity being cancelled was read before the
+impulse lands, so at full strength the correction is a tick out of phase with
+what it is correcting. `PG_PIN_VELOCITY_CANCEL` is 0.6 for that reason alone -
+at 1.0, every proportional gain worth using was divergent.
+
+The pin's three constants were swept together against simulated latencies of
+zero, one and two ticks, since the true figure is not observable from outside
+the game. Nothing survives two; these sit comfortably inside stability at one:
+
+| loop | gain | root magnitude | peak overshoot |
+|---|---|---|---|
+| carry spring (default, and at max strength) | 0.01 - 0.03 | 0.09 - 0.16 | none |
+| carry spin damping (default, and at max) | 0.27 - 0.72 | 0.52 - 0.85 | none |
+| freeze spin damping | 0.72 | 0.85 | none |
+
+### What it will not do
+
+- **Creative only.** `CreativePlayer.lua` is not loaded in Survival.
+- **Anchored bodies.** Anything welded to the ground or sat on a lift ignores
+  impulses; the physgun says so rather than leaving you to wonder.
+- **No inventory item.** It is a hotkey, not a tool in the hotbar - a real tool
+  needs new UUIDs in the shapeset and `inventoryDescriptions.json` through
+  `PatchAsset`, plus a model and animations.
+- **A frozen single body can be left rotated.** The pin holds position exactly
+  and brakes spin hard, but restoring an orientation needs inertia, which the
+  API does not expose. Anything with more than one body holds its rotation
+  anyway, because several pinned points leave nothing to rotate about.
+- **Multiplayer needs the host to have the mod**, since all the physics is
+  server-side.
 
 ## Changing game behaviour without touching game files
 

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>PhysgunMod</AssemblyName>
+    <RootNamespace>PhysgunMod</RootNamespace>
+    <!-- Build straight into the staged loader layout. -->
+    <OutputPath>$(DistDir)Mods\PhysgunMod\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Private=false: SMLoader.Api is supplied by the loader's own context. -->
+    <ProjectReference Include="..\..\src\SMLoader.Api\SMLoader.Api.csproj" Private="false" />
+  </ItemGroup>
+</Project>

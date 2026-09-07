@@ -7,6 +7,7 @@
         dist\SMLoader.Shim.dll
         dist\SMLoader.Core.dll  + runtimeconfig.json + SMLoader.Api.dll
         dist\Mods\NoclipMod\NoclipMod.dll
+        dist\Mods\PhysgunMod\PhysgunMod.dll
 #>
 [CmdletBinding()]
 param(
@@ -50,6 +51,9 @@ if ($LASTEXITCODE -ne 0) { throw "SMLoader.Launcher build failed" }
 Write-Host "==> Building mods" -ForegroundColor Cyan
 dotnet build (Join-Path $root 'mods\NoclipMod\NoclipMod.csproj') -c $Configuration --nologo
 if ($LASTEXITCODE -ne 0) { throw "NoclipMod build failed" }
+
+dotnet build (Join-Path $root 'mods\PhysgunMod\PhysgunMod.csproj') -c $Configuration --nologo
+if ($LASTEXITCODE -ne 0) { throw "PhysgunMod build failed" }
 
 Write-Host ""
 Write-Host "Build complete. Run it with:" -ForegroundColor Green
